@@ -58,7 +58,7 @@ What every feature in these two scripts actually does. For installation and conf
 ### Rainbow Button Colors
 
 - Home screen buttons are recolored in strict spectral order: Battle! (red) → Teambuilder (orange) → Ladder (yellow) → Tournaments (green) → Watch a battle (light blue) → Find a user (blue) → Friends (violet) → Info & Resources (magenta).
-- Buttons that are genuinely disabled (before you've logged in) correctly show a grayed-out look instead of full color, so it's still clear they're not clickable yet.
+- Buttons that are disabled (before you've logged in) correctly show a grayed-out look instead of full color, so it's still clear they're not clickable yet.
 
 ---
 
