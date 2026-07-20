@@ -1,7 +1,0 @@
-{
-  "github_token": "ghp_your_personal_access_token_here",
-  "repo_owner": "your-github-username",
-  "repo_name": "your-repo-name",
-  "branch": "main",
-  "repo_folder": "Showdown Music"
-}
