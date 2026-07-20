@@ -3,7 +3,7 @@
 // @namespace    showdown-qol-suite
 // @version      1.2
 // @description  Auto-imports Pokémon sets from Showdown Teambuilder into the NCP VGC Damage Calculator
-// @author       You
+// @author       Volcano08
 // @match        https://nerd-of-now.github.io/NCP-VGC-Damage-Calculator/*
 // @grant        none
 // @run-at       document-idle
