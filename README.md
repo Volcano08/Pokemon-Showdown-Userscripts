@@ -128,7 +128,7 @@ Changes what the "Upload to PokePaste (Open Team Sheet)" button in the Teambuild
 - **Ctrl+Alt+0** (**Cmd+0** on Mac) resets to 100%.
 - A brief on-screen indicator shows the current percentage each time you adjust it.
 - Your chosen size is remembered across reloads.
-- Only chat and battle-log text are affected. Buttons and other UI stay their normal size. Showdown has no built-in setting for this otherwise.
+- Only chat and battle-log text are affected. Buttons and other UI stay their normal size.
 
 ### Rainbow Button Colors
 
