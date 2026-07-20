@@ -33,9 +33,9 @@ Everything you'd want to hand-edit is gathered in one `CONFIG` section near the 
 | `ALLOWED_ROOMS` | Which rooms show by default in the room list (before hitting "Show more rooms"). Edit the list to whichever rooms you want to see. |
 | `MUSIC_TRACKS` | Empty by default. This is a list of direct mp3 URLs used by the music player and the Ctrl+Alt+M (Cmd+M on Mac) picker. |
 
-**Adding your own music:** `MUSIC_TRACKS` starts empty on purpose. It's meant to hold links to *your own* hosted tracks, not come preloaded with someone else's. The companion **Showdown Music Uploader** tool (its own folder in this repo, with its own setup instructions) handles converting, cleaning up, and uploading your own audio files to GitHub, then hands you back entries in exactly the format this array expects, ready to paste in.
+**Adding your own music:** `MUSIC_TRACKS` starts empty on purpose. It's meant to hold links to *your own* hosted tracks. The companion **Showdown Music Uploader** tool (its own folder in this repo, with its own setup instructions) handles converting, cleaning up, and uploading your own audio files to GitHub, then hands you back entries in exactly the format this array expects, ready to paste in.
 
-Everything else (Open Team Sheets behavior, auto-copy/close replay, Battle Mode, Teambuilder Mode, quick-links toggle, whether OTS Pokepaste exports include Nature) is configured live from Showdown's own **Options** popup once the script is running, and is saved automatically. No need to edit the script for any of that.
+Everything else (Open Team Sheets behavior, auto-copy/close replay, Battle Mode, Teambuilder Mode, quick-links toggle, whether OTS Pokepaste exports include Nature) is configured from Showdown's own **Options** popup once the script is running, and is saved automatically. No need to edit the script for any of that.
 
 ## Configuring NCP Calc Auto-Import
 
@@ -133,7 +133,7 @@ Changes what the "Upload to PokePaste (Open Team Sheet)" button in the Teambuild
 ### Rainbow Button Colors
 
 - Home screen buttons are recolored in strict spectral order: Battle! (red) → Teambuilder (orange) → Ladder (yellow) → Tournaments (green) → Watch a battle (light blue) → Find a user (blue) → Friends (violet) → Info & Resources (magenta).
-- Buttons that are genuinely disabled (before you've logged in) correctly show a grayed-out look instead of full color, so it's still clear they're not clickable yet.
+- Buttons that are disabled (before you've logged in) correctly show a grayed-out look instead of full color, so it's still clear they're not clickable yet.
 
 ---
 
