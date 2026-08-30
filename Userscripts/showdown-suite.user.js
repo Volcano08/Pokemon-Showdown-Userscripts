@@ -925,7 +925,14 @@
 
 			if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
 				var hasContent = tag === 'textarea' && document.activeElement.value.length > 0;
-				if (!soundsOpen && !hasContent) {
+				// Being focused on a text-type input at all (like the
+				// Pokemon search box) should take priority for cursor
+				// movement, regardless of whether it currently has
+				// content - unlike the chat textarea case above, where
+				// only non-empty content blocks tab-cycling.
+				var inputType = tag === 'input' ? (document.activeElement.type || 'text').toLowerCase() : '';
+				var isTextInputField = tag === 'input' && ['text', 'search', 'email', 'url', 'tel', 'password', 'number'].indexOf(inputType) !== -1;
+				if (!soundsOpen && !hasContent && !isTextInputField) {
 					e.preventDefault();
 					e.stopImmediatePropagation();
 					if (document.activeElement && document.activeElement !== document.body) {
@@ -2065,6 +2072,567 @@
 	})();
 
 	// ============================================================
+	// ADVANCED POKEMON SEARCH
+	// ============================================================
+	// Adds JS-style boolean operators (&&, ||, !, parentheses for
+	// grouping) and stat comparisons (Spe > 100, Atk >= 125, etc) to the
+	// Pokemon search box. A + button next to the box adds additional
+	// condition rows (operator dropdown + term field, where ! still
+	// works as a prefix on the term itself for negation) rather than
+	// requiring the whole expression to be typed by hand. Only
+	// activates when the resulting query actually contains this syntax
+	// - Showdown's own, existing search is completely untouched
+	// otherwise. Works by overwriting the live search object's own
+	// resultSet/results directly, matching whichever of Showdown's two
+	// internal search implementations is actually present, so
+	// Showdown's own table rendering, tier grouping, and stat columns
+	// handle everything, completely unmodified.
+	(function () {
+		var STAT_NAMES = ['hp', 'atk', 'def', 'spa', 'spd', 'spe'];
+		var COMPARISON_OPS = ['>=', '<=', '==', '>', '<'];
+
+		// The real getQolPref/setQolPref live in the separate "Showdown
+		// Battle Update" section's own IIFE, which - unlike what was
+		// assumed - is a genuinely separate scope from this section's,
+		// not part of one shared top-level scope. Sibling IIFEs can't
+		// see each other's local functions regardless of file order, so
+		// reaching across for getQolPref throws a ReferenceError. This
+		// reads directly from the same underlying localStorage key
+		// ('qol2-settings') instead, self-contained within this
+		// section's own scope, matching exactly what the real
+		// getQolPref('advancedSearch', true) call does.
+		function isAdvancedSearchEnabled() {
+			try {
+				var p = JSON.parse(localStorage.getItem('qol2-settings') || '{}');
+				return ('advancedSearch' in p) ? p.advancedSearch : true;
+			} catch (e) { return true; }
+		}
+
+		function hideIllegalMonsEnabled() {
+			try {
+				var p = JSON.parse(localStorage.getItem('qol2-settings') || '{}');
+				return ('hideIllegalMons' in p) ? p.hideIllegalMons : false;
+			} catch (e) { return false; }
+		}
+
+		// Rather than reimplementing Showdown's own format-type/generation
+		// detection and the nested, per-format overrideTier table lookup
+		// (genuinely intricate - see getTier in battle-dex-search.ts),
+		// this calls the live search object's own, already-correctly-
+		// configured engine directly, matching exactly what Showdown's
+		// own tier column displays for the pokemon currently selected
+		// format. Fails open (treats as legal, i.e. doesn't filter it
+		// out) if the engine or getTier isn't reachable for any reason -
+		// a missed filter is a minor inconvenience, but breaking the
+		// whole search over this would not be.
+		function isLegalForCurrentFormat(liveSearch, speciesId) {
+			try {
+				var engine = liveSearch.engine || liveSearch.typedSearch;
+				console.log('[AdvSearch] isLegalForCurrentFormat: speciesId =', speciesId, '| liveSearch.engine =', liveSearch.engine, '| liveSearch.typedSearch =', liveSearch.typedSearch, '| resolved engine =', engine);
+				if (!engine || typeof engine.getTier !== 'function') {
+					console.log('[AdvSearch] isLegalForCurrentFormat: no usable engine.getTier found - failing open (treating as legal)');
+					return true;
+				}
+				var species = win.Dex.species.get(speciesId);
+				var tier = engine.getTier(species);
+				console.log('[AdvSearch] isLegalForCurrentFormat: species =', species && species.name, '| tier returned =', JSON.stringify(tier));
+				return ['Illegal', 'Unreleased'].indexOf(tier) === -1;
+			} catch (e) {
+				console.log('[AdvSearch] isLegalForCurrentFormat: threw, failing open (not filtering) -', e.message);
+				return true;
+			}
+		}
+
+		// Showdown groups result rows under tier-header rows (shape:
+		// ['header', 'OU'], ['header', 'Illegal results'], etc, per
+		// renderRow's 'header' case). Filtering out illegal pokemon rows
+		// only ever removes the pokemon rows themselves - if that
+		// leaves a header with nothing grouped underneath it (either
+		// the array ends right after it, or another header immediately
+		// follows), the now-empty header row is left behind untouched.
+		// This strips any header row that isn't immediately followed by
+		// at least one real content row.
+		function removeOrphanedHeaders(rows) {
+			return rows.filter(function (row, i) {
+				if (!Array.isArray(row) || row[0] !== 'header') return true;
+				var next = rows[i + 1];
+				return !!(next && Array.isArray(next) && next[0] !== 'header');
+			});
+		}
+
+		function tokenize(query) {
+			var pattern = /\s*(&&|\|\||!|\(|\)|>=|<=|==|>|<|[a-zA-Z0-9]+(?:\s+[a-zA-Z0-9]+)*)\s*/g;
+			var tokens = [];
+			var match, lastIndex = 0;
+			while ((match = pattern.exec(query)) !== null) {
+				if (match.index !== lastIndex) return null;
+				tokens.push(match[1]);
+				lastIndex = pattern.lastIndex;
+			}
+			if (lastIndex !== query.length) return null;
+			return tokens;
+		}
+
+		function parseTokens(tokens) {
+			var pos = 0;
+			function peek() { return tokens[pos]; }
+			function next() { return tokens[pos++]; }
+			function parseOr() {
+				var left = parseAnd();
+				while (peek() === '||') { next(); left = { type: 'or', left: left, right: parseAnd() }; }
+				return left;
+			}
+			function parseAnd() {
+				var left = parseNot();
+				while (peek() === '&&') { next(); left = { type: 'and', left: left, right: parseNot() }; }
+				return left;
+			}
+			function parseNot() {
+				if (peek() === '!') { next(); return { type: 'not', operand: parseNot() }; }
+				return parseAtom();
+			}
+			function parseAtom() {
+				if (peek() === '(') {
+					next();
+					var expr = parseOr();
+					if (next() !== ')') throw new Error('mismatched parens');
+					return expr;
+				}
+				var word = next();
+				if (word === undefined) throw new Error('unexpected end');
+				if (STAT_NAMES.indexOf(word.toLowerCase()) !== -1 && COMPARISON_OPS.indexOf(peek()) !== -1) {
+					var op = next();
+					var num = parseInt(next(), 10);
+					if (isNaN(num)) throw new Error('expected number');
+					return { type: 'stat', stat: word.toLowerCase(), op: op, value: num };
+				}
+				return { type: 'word', value: word };
+			}
+			var result = parseOr();
+			if (pos !== tokens.length) throw new Error('unexpected trailing token');
+			return result;
+		}
+
+		// Walks the learnset chain through pre-evolutions/battle-only
+		// forms/alternate formes (e.g. Charizard's learnset references
+		// Charmeleon's, which references Charmander's), matching the
+		// core chain-walking Showdown's own source uses. This is a
+		// simplified, "can this species learn this move at all"
+		// check - it doesn't replicate the full, format-specific
+		// generation-letter/tradebacks/egg-move-only nuance the real
+		// client's canLearn() does, since the goal here is a general
+		// learnset check, not exact per-format legality.
+		var learnsetChainCache = {};
+		function getLearnsetChain(speciesId) {
+			if (learnsetChainCache[speciesId]) return learnsetChainCache[speciesId];
+			var table = win.BattleTeambuilderTable;
+			var chain = [];
+			if (table && table.learnsets) {
+				var currentId = speciesId;
+				var seen = {};
+				while (currentId && !seen[currentId]) {
+					seen[currentId] = true;
+					if (table.learnsets[currentId]) chain.push(table.learnsets[currentId]);
+					var species = win.Dex.species.get(currentId);
+					if (!species || !species.exists) break;
+					var next = species.battleOnly || species.changesFrom || species.prevo;
+					currentId = next ? String(next).toLowerCase().replace(/[^a-z0-9]/g, '') : null;
+				}
+			}
+			learnsetChainCache[speciesId] = chain;
+			return chain;
+		}
+
+		function canLearnMove(speciesId, moveId) {
+			var chain = getLearnsetChain(speciesId);
+			return chain.some(function (learnset) { return moveId in learnset; });
+		}
+
+		function evaluateNode(node, data) {
+			switch (node.type) {
+				case 'or': return evaluateNode(node.left, data) || evaluateNode(node.right, data);
+				case 'and': return evaluateNode(node.left, data) && evaluateNode(node.right, data);
+				case 'not': return !evaluateNode(node.operand, data);
+				case 'stat':
+					var actual = data.baseStats[node.stat];
+					switch (node.op) {
+						case '>': return actual > node.value;
+						case '<': return actual < node.value;
+						case '>=': return actual >= node.value;
+						case '<=': return actual <= node.value;
+						case '==': return actual === node.value;
+					}
+					return false;
+				case 'word':
+					var w = node.value.toLowerCase().replace(/[^a-z0-9]/g, '');
+					// "Mega" and "Gmax" are special-cased as form filters
+					// rather than treated as literal type/ability/move
+					// lookups, since neither is a real type, ability, or
+					// move name.
+					if (w === 'mega') return data.isMega;
+					if (w === 'gmax') return data.isGmax;
+					var typeMatch = data.types.some(function (t) { return t.toLowerCase().replace(/[^a-z0-9]/g, '') === w; });
+					if (typeMatch) return true;
+					var abilityMatch = data.abilities.some(function (a) { return a.toLowerCase().replace(/[^a-z0-9]/g, '') === w; });
+					if (abilityMatch) return true;
+					// Falls back to checking whether this species can
+					// learn a move by this name (e.g. "Fake Out") -
+					// only reached when the term didn't match a type
+					// or ability, since walking the learnset chain is
+					// more work than a simple comparison.
+					return canLearnMove(data.id, w);
+			}
+			return false;
+		}
+
+		function looksLikeAdvancedQuery(query) {
+			if (/&&|\|\||!/.test(query)) return true;
+			if (new RegExp('\\b(' + STAT_NAMES.join('|') + ')\\s*(>=|<=|==|>|<)').test(query.toLowerCase())) return true;
+			var trimmed = query.trim().toLowerCase();
+			if (trimmed === 'mega' || trimmed === 'gmax') return true;
+			return false;
+		}
+
+		function getAllPokemonData() {
+			var dex = win.Dex;
+			var pokedex = win.BattlePokedex || {};
+			var results = [];
+			Object.keys(pokedex).forEach(function (id) {
+				try {
+					var species = dex.species.get(id);
+					if (!species || !species.exists || species.num < 1) return;
+					var abilityTable = species.abilities || {};
+					var abilities = Object.keys(abilityTable).map(function (k) { return abilityTable[k]; });
+					results.push({
+						id: id,
+						name: species.name,
+						types: species.types || [],
+						abilities: abilities,
+						baseStats: species.baseStats || {},
+						isMega: !!species.isMega,
+						// Gmax forms are distinct dex entries whose ids
+						// consistently end in "gmax" (e.g. "charizardgmax",
+						// confirmed directly against the real dex ids),
+						// unlike canGigantamax, which instead marks the
+						// base form as merely having a Gmax form available.
+						isGmax: /gmax$/.test(id),
+					});
+				} catch (e) {}
+			});
+			return results;
+		}
+
+		var cachedPokemonData = null;
+		function getCachedPokemonData() {
+			if (!cachedPokemonData) cachedPokemonData = getAllPokemonData();
+			return cachedPokemonData;
+		}
+
+		// The team-editor context exposes a newer, Preact-based search
+		// object as win.editor.search; the standalone dex-browser table
+		// (the sortable one with tier headers and stat columns) exposes
+		// an older, jQuery-based one directly as win.search. Both are
+		// confirmed, deliberate debug exposures in Showdown's own client
+		// code - this handles whichever shape is actually present.
+		function getLiveSearch() {
+			console.log('[AdvSearch] getLiveSearch: win.editor =', win.editor, '| win.search =', win.search);
+			if (win.editor && win.editor.search) {
+				console.log('[AdvSearch] getLiveSearch: using win.editor.search (Preact-style)');
+				return win.editor.search;
+			}
+			if (win.search) {
+				console.log('[AdvSearch] getLiveSearch: using win.search directly (jQuery-style)');
+				return win.search;
+			}
+			console.log('[AdvSearch] getLiveSearch: FOUND NOTHING - neither win.editor.search nor win.search exist');
+			return null;
+		}
+
+		function applyResultsToLiveSearch(liveSearch, matchingRows, query) {
+			console.log('[AdvSearch] applyResultsToLiveSearch called with', matchingRows.length, 'rows, query =', JSON.stringify(query));
+			console.log('[AdvSearch] applyResultsToLiveSearch: liveSearch object =', liveSearch);
+			// Older, jQuery-based Search class: renders directly into a
+			// DOM element via resultSet + updateScroll(forceAdd), not a
+			// virtual-DOM re-render.
+			if (typeof liveSearch.updateScroll === 'function' && 'resultSet' in liveSearch) {
+				console.log('[AdvSearch] applyResultsToLiveSearch: taking jQuery-style branch (resultSet + updateScroll)');
+				liveSearch.resultSet = matchingRows;
+				liveSearch.q = query;
+				liveSearch.renderedIndex = 0;
+				liveSearch.renderingDone = false;
+				liveSearch.updateScroll(true);
+				console.log('[AdvSearch] applyResultsToLiveSearch: updateScroll(true) called, liveSearch.el.innerHTML is now:', liveSearch.el && liveSearch.el.innerHTML);
+				return;
+			}
+			// Newer, Preact-based DexSearch class.
+			if ('results' in liveSearch) {
+				console.log('[AdvSearch] applyResultsToLiveSearch: taking Preact-style branch (results + resultsComponent.forceUpdate)');
+				liveSearch.results = matchingRows;
+				if (liveSearch.resultsComponent && typeof liveSearch.resultsComponent.forceUpdate === 'function') {
+					liveSearch.resultsComponent.forceUpdate();
+					console.log('[AdvSearch] applyResultsToLiveSearch: resultsComponent.forceUpdate() called');
+				} else {
+					console.log('[AdvSearch] applyResultsToLiveSearch: WARNING - no resultsComponent.forceUpdate found, results set but nothing re-rendered');
+				}
+				return;
+			}
+			console.log('[AdvSearch] applyResultsToLiveSearch: WARNING - liveSearch matched NEITHER known shape, nothing applied');
+		}
+
+		function runSearch(inputEl, commitAsFilter) {
+			console.log('[AdvSearch] ===== runSearch called ===== commitAsFilter =', commitAsFilter);
+			var query = inputEl.value;
+			console.log('[AdvSearch] runSearch: query =', JSON.stringify(query));
+			if (!looksLikeAdvancedQuery(query)) {
+				console.log('[AdvSearch] runSearch: looksLikeAdvancedQuery returned false, bailing out');
+				return;
+			}
+			console.log('[AdvSearch] runSearch: looksLikeAdvancedQuery returned true, proceeding');
+			var liveSearch = getLiveSearch();
+			if (!liveSearch) {
+				console.log('[AdvSearch] runSearch: getLiveSearch returned null, bailing out');
+				return;
+			}
+			var tokens = tokenize(query);
+			console.log('[AdvSearch] runSearch: tokenize result =', JSON.stringify(tokens));
+			if (!tokens) {
+				console.log('[AdvSearch] runSearch: tokenize returned null (unrecognized character), bailing out');
+				return;
+			}
+			var tree;
+			try {
+				tree = parseTokens(tokens);
+				console.log('[AdvSearch] runSearch: parseTokens succeeded, tree =', JSON.stringify(tree));
+			} catch (err) {
+				console.log('[AdvSearch] runSearch: parseTokens THREW an error:', err.message, '- bailing out');
+				return;
+			}
+			var allMons = getCachedPokemonData();
+			console.log('[AdvSearch] runSearch: total pokemon data available =', allMons.length);
+			var matchingMons = allMons.filter(function (mon) {
+				try { return evaluateNode(tree, mon); } catch (e) {
+					console.log('[AdvSearch] runSearch: evaluateNode threw for', mon.name, '-', e.message);
+					return false;
+				}
+			});
+			console.log('[AdvSearch] runSearch: matched', matchingMons.length, 'pokemon before legality filter');
+			if (hideIllegalMonsEnabled()) {
+				matchingMons = matchingMons.filter(function (mon) { return isLegalForCurrentFormat(liveSearch, mon.id); });
+				console.log('[AdvSearch] runSearch: hideIllegalMons enabled, narrowed to', matchingMons.length, 'legal-for-current-format pokemon');
+			}
+			var matchingRows = matchingMons.sort(function (a, b) { return a.name.localeCompare(b.name); })
+				.map(function (mon) { return ['pokemon', mon.id]; });
+			console.log('[AdvSearch] runSearch: final matched', matchingRows.length, 'pokemon:', matchingRows.map(function (r) { return r[1]; }));
+			if (commitAsFilter) {
+				// Same 'html' row-type Showdown's own filter chips use
+				// (e.g. "Filters: Water x"), so it renders identically -
+				// then clear the input, matching how a committed native
+				// filter empties the search box.
+				var chipHtml = '<p>Filters: <button class="filter">' + query + ' <i class="fa fa-times-circle"></i></button></p>';
+				matchingRows = [['html', chipHtml]].concat(matchingRows);
+				inputEl.value = '';
+				console.log('[AdvSearch] runSearch: commitAsFilter true, prepended filter chip html and cleared input');
+			}
+			applyResultsToLiveSearch(liveSearch, matchingRows, query);
+			console.log('[AdvSearch] ===== runSearch finished =====');
+		}
+
+		// ---- Inserting into the query instead of committing immediately ----
+		// Rather than building our own suggestion dropdown, this lets
+		// Showdown's own native autocomplete show completely normally -
+		// clicking one of its suggestions (type, ability, pokemon, etc,
+		// rendered as <a data-entry="type|Water"> within the results
+		// area) gets redirected to insert that name into the search box
+		// at the current trailing-term position, instead of Showdown's
+		// normal behavior of immediately committing it as a filter.
+		// Native arrow-key/Tab/Escape navigation within Showdown's own
+		// list is left completely untouched, since there's no custom
+		// dropdown of ours to navigate anymore.
+		function getTrailingTermInfo(fullValue) {
+			var match = /(?:&&|\|\||\(|^)(\s*)(!?)(\s*)([a-zA-Z0-9]*)$/.exec(fullValue);
+			if (!match) return null;
+			return { partial: match[4], matchStart: match.index + match[0].length - match[4].length };
+		}
+
+		function replaceTrailingTerm(fullValue, info, newWord) {
+			return fullValue.slice(0, info.matchStart) + newWord;
+		}
+
+		function insertIntoQuery(inputEl, name) {
+			var info = getTrailingTermInfo(inputEl.value) || { matchStart: inputEl.value.length };
+			inputEl.value = replaceTrailingTerm(inputEl.value, info, name);
+			inputEl.focus();
+			console.log('[AdvSearch] insertIntoQuery: inserted', JSON.stringify(name), '- new value =', JSON.stringify(inputEl.value));
+		}
+
+		document.addEventListener('click', function (e) {
+			if (!isAdvancedSearchEnabled()) return;
+			var entryEl = e.target.closest ? e.target.closest('a[data-entry]') : null;
+			if (!entryEl) return;
+			var liveSearch = getLiveSearch();
+			if (!liveSearch || !liveSearch.el || !liveSearch.el.contains(entryEl)) return;
+			var inputEl = document.querySelector('input[name="pokemon"]');
+			if (!inputEl) return;
+			var entryParts = entryEl.dataset.entry.split('|');
+			var displayName = entryParts[1];
+			if (!displayName) return;
+			console.log('[AdvSearch] click: intercepted native suggestion click, data-entry =', entryEl.dataset.entry);
+			e.preventDefault();
+			e.stopImmediatePropagation();
+			insertIntoQuery(inputEl, displayName);
+		}, true);
+
+		// Once the query contains our syntax, Showdown's own native
+		// handling for this input is fully blocked (via
+		// stopImmediatePropagation in the capturing phase) rather than
+		// left running alongside ours - letting both run and betting on
+		// timing to make ours win is exactly what caused the earlier
+		// event-phase and stopPropagation bugs. Blocking outright avoids
+		// that whole category of problem. Normal typing (before any
+		// special syntax appears) is completely unaffected either way.
+		document.addEventListener('input', function (e) {
+			if (!isAdvancedSearchEnabled()) return;
+			var el = e.target;
+			if (!el.matches || !el.matches('input[name="pokemon"]')) return;
+			var isAdvanced = looksLikeAdvancedQuery(el.value);
+			console.log('[AdvSearch] input event: value =', JSON.stringify(el.value), '| looksLikeAdvancedQuery =', isAdvanced);
+			if (isAdvanced) {
+				e.stopImmediatePropagation();
+				console.log('[AdvSearch] input event: stopImmediatePropagation called (blocking Showdown native input handling)');
+			}
+		}, true);
+
+		// On Enter: commits the current expression as a persistent
+		// filter chip. Only intercepts Enter specifically - Showdown's
+		// own native arrow-key/Tab/Escape navigation through its own
+		// autocomplete list is left completely untouched, since we no
+		// longer have a custom dropdown of our own to navigate.
+		//
+		// This runs on keydown, not keyup: Showdown's own native
+		// Enter-handling clears the input (.val('').select()) during
+		// its own keydown phase, before a keyup-based listener would
+		// ever get a chance to read the value.
+		var justHandledByUs = false;
+		document.addEventListener('keydown', function (e) {
+			if (!isAdvancedSearchEnabled()) return;
+			if (e.key !== 'Enter') return;
+			var el = e.target;
+			if (!el.matches || !el.matches('input[name="pokemon"]')) return;
+			var isAdvanced = looksLikeAdvancedQuery(el.value);
+			console.log('[AdvSearch] === keydown Enter === value =', JSON.stringify(el.value), '| isAdvanced =', isAdvanced);
+			if (!isAdvanced) {
+				console.log('[AdvSearch] keydown: not an advanced query - letting Showdown handle Enter normally');
+				return;
+			}
+			e.preventDefault();
+			e.stopImmediatePropagation();
+			justHandledByUs = true;
+			console.log('[AdvSearch] keydown: preventDefault + stopImmediatePropagation called, calling runSearch(el, true) now');
+			runSearch(el, true);
+		}, true);
+
+		// Showdown has a separate native keyup handler (chartKeyUp) that
+		// re-runs its own search based on the input's raw current value
+		// on every keyup - since that native search can only ever
+		// meaningfully operate on a single, literal term (it has no
+		// concept of boolean expressions), letting it see the whole
+		// compound string once our syntax is present fuzzy-matches the
+		// wrong thing (e.g. "Water Compaction" while typing
+		// "water&&competitive"). Rather than blocking it outright
+		// (which would lose native autocomplete for every term after
+		// the first), this temporarily isolates just the current,
+		// trailing term in the input's value right before Showdown's
+		// own handler reads it - letting its native autocomplete
+		// correctly run against just that term - then restores the
+		// full, visible expression right after, once native handling
+		// has had its turn (via setTimeout, so it runs after the
+		// current, synchronous event-dispatch cycle completes).
+		document.addEventListener('keyup', function (e) {
+			if (!isAdvancedSearchEnabled()) return;
+			var el = e.target;
+			if (!el.matches || !el.matches('input[name="pokemon"]')) return;
+
+			if (justHandledByUs) {
+				justHandledByUs = false;
+				e.preventDefault();
+				e.stopImmediatePropagation();
+				console.log('[AdvSearch] keyup: blocking native (post-commit cleanup)');
+				return;
+			}
+
+			var isAdvanced = looksLikeAdvancedQuery(el.value);
+			if (!isAdvanced) return; // normal, single-term typing - Showdown's native autocomplete already works correctly as-is
+
+			var info = getTrailingTermInfo(el.value);
+			if (!info) {
+				// Nothing isolatable right now (e.g. right after an
+				// operator with nothing typed yet) - block native
+				// handling entirely for this instant, since there's no
+				// meaningful term to autocomplete against anyway.
+				e.stopImmediatePropagation();
+				console.log('[AdvSearch] keyup: no isolatable trailing term, blocking native handling entirely for this instant');
+				return;
+			}
+
+			var fullValue = el.value;
+			el.value = info.partial;
+			console.log('[AdvSearch] keyup: temporarily isolated trailing term for native autocomplete:', JSON.stringify(info.partial), '(full value was', JSON.stringify(fullValue) + ')');
+			setTimeout(function () {
+				el.value = fullValue;
+				console.log('[AdvSearch] keyup: restored full value after native autocomplete ran:', JSON.stringify(fullValue));
+			}, 0);
+		}, true);
+
+		// Independent of the advanced-search syntax entirely: a plain,
+		// single-term query (e.g. just "drizzle") never enters our own
+		// runSearch pipeline at all, since Showdown's native search
+		// handles it completely on its own - so the hideIllegalMons
+		// filtering integrated into runSearch never gets a chance to
+		// apply there. This runs on every keyup regardless, and - only
+		// when the setting is on - post-filters whatever results are
+		// currently showing (native or ours) after they've been
+		// computed, via the same setTimeout-after-current-cycle
+		// approach used above.
+		document.addEventListener('keyup', function (e) {
+			if (!hideIllegalMonsEnabled()) return;
+			var el = e.target;
+			if (!el.matches || !el.matches('input[name="pokemon"]')) return;
+			setTimeout(function () {
+				var liveSearch = getLiveSearch();
+				if (!liveSearch) return;
+				if (typeof liveSearch.updateScroll === 'function' && Array.isArray(liveSearch.resultSet)) {
+					var rows = liveSearch.resultSet;
+					var filtered = removeOrphanedHeaders(rows.filter(function (row) {
+						return !Array.isArray(row) || row[0] !== 'pokemon' || isLegalForCurrentFormat(liveSearch, row[1]);
+					}));
+					if (filtered.length !== rows.length) {
+						console.log('[AdvSearch] post-filter (independent of advanced syntax): removed', rows.length - filtered.length, 'illegal mons/orphaned headers from', rows.length, 'total rows');
+						liveSearch.resultSet = filtered;
+						liveSearch.renderedIndex = 0;
+						liveSearch.renderingDone = false;
+						liveSearch.updateScroll(true);
+						console.log('[AdvSearch] post-filter: updateScroll(true) called, liveSearch.el.innerHTML is now:', liveSearch.el && liveSearch.el.innerHTML);
+					}
+					return;
+				}
+				if (Array.isArray(liveSearch.results)) {
+					var rows2 = liveSearch.results;
+					var filtered2 = removeOrphanedHeaders(rows2.filter(function (row) {
+						return !Array.isArray(row) || row[0] !== 'pokemon' || isLegalForCurrentFormat(liveSearch, row[1]);
+					}));
+					if (filtered2.length !== rows2.length) {
+						console.log('[AdvSearch] post-filter (Preact-style, independent of advanced syntax): removed', rows2.length - filtered2.length, 'illegal mons/orphaned headers');
+						liveSearch.results = filtered2;
+						if (liveSearch.resultsComponent && typeof liveSearch.resultsComponent.forceUpdate === 'function') {
+							liveSearch.resultsComponent.forceUpdate();
+						}
+					}
+				}
+			}, 0);
+		}, true);
+	})();
+
+	// ============================================================
 	// SHOWDOWN BATTLE UPDATE
 	// ============================================================
 	(function () {
@@ -2155,6 +2723,8 @@
 					'<div class="qol2-section-body" id="qol2-tb-body">',
 					'<p><label class="checkbox"><input type="checkbox" name="qol2-tbquicklinks"' + (getQolPref('tbquicklinks', false) ? ' checked' : '') + ' /> Show Pokémon quick-links in Teambuilder</label></p>',
 					'<p><label class="checkbox"><input type="checkbox" name="qol2-otsnature"' + (getQolPref('otsnature', true) ? ' checked' : '') + ' /> Include Nature in OTS Pokepaste export</label></p>',
+					'<p><label class="checkbox"><input type="checkbox" name="qol2-advsearch"' + (getQolPref('advancedSearch', true) ? ' checked' : '') + ' /> Use advanced Teambuilder search (boolean logic, stat filters, Mega/Gmax)</label></p>',
+					'<p><label class="checkbox"><input type="checkbox" name="qol2-hideillegal"' + (getQolPref('hideIllegalMons', false) ? ' checked' : '') + ' /> Hide Pokémon illegal in the current format from advanced search results</label></p>',
 					'</div>',
 				].join('')));
 
@@ -2167,6 +2737,12 @@
 				});
 				$el.find('input[name="qol2-otsnature"]').on('change', function () {
 					setQolPref('otsnature', this.checked);
+				});
+				$el.find('input[name="qol2-advsearch"]').on('change', function () {
+					setQolPref('advancedSearch', this.checked);
+				});
+				$el.find('input[name="qol2-hideillegal"]').on('change', function () {
+					setQolPref('hideIllegalMons', this.checked);
 				});
 
 				$lastHr.before($([
