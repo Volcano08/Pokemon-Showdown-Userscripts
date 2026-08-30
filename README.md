@@ -96,6 +96,21 @@ If either message is missing, the script isn't running on that page. Check that 
 - Subfolders show indented under their parent in the sidebar.
 - The battle team-selector popup (when choosing a team to bring into a match) shows folder names properly indented for subfolders instead of the full "Parent/Child" path.
 
+### Advanced Teambuilder Search
+
+Adds boolean logic, stat filters, and a few other conveniences to the Pokémon search box in Teambuilder and the Pokédex browser.
+
+- Combine terms with `&&` (and), `||` (or), and `!` (not), with parentheses for grouping - e.g. `water && !flying`, `(steel || rock) && spe>100`.
+- Stat comparisons for any of the six base stats: `spe>100`, `atk>=125`, `def<80`, etc.
+- Search by ability, type, or move in the same expression - e.g. `water && fake out` finds Water-types that can learn Fake Out.
+- Multi-word ability and move names work as single terms (`clear body`, `fake out`) without needing quotes.
+- Type "Mega" or "Gmax" as their own term to filter to just those forms - e.g. `mega` on its own, or `fire && mega` for Mega fire-types.
+- Clicking any of Showdown's own suggestions (type, ability, move, whatever's showing) inserts it into your query instead of immediately searching, so you can keep building a compound expression. Autocomplete keeps working normally for every term you type, not just the first one.
+- Press Enter to commit the whole expression as a filter chip, same as a native Showdown filter.
+- A completely plain, single-term search (just a name, no special syntax) is untouched - Showdown's own native search handles it exactly as before.
+- Toggle in Options → Teambuilder → **"Use advanced Teambuilder search"** (on by default). Turning it off restores Showdown's completely default search behavior.
+- **"Hide Pokémon illegal in the current format from advanced search results"** (Options → Teambuilder, off by default): removes anything illegal for whatever format you currently have selected - e.g. searching `drizzle` in a format where Kyogre is banned won't show Kyogre. Applies to both special-syntax searches and plain, single-term ones, and automatically adjusts if you switch formats.
+
 ### Battle Update
 
 - Every section of the Options popup (including Showdown's own built-in ones) can be collapsed by clicking its header, and remembers your collapsed/expanded choice.
