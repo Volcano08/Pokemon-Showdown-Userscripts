@@ -101,11 +101,11 @@ If either message is missing, the script isn't running on that page. Check that 
 Adds boolean logic, stat filters, and a few other conveniences to the Pokémon search box in Teambuilder and the Pokédex browser.
 
 - Combine terms with `&&` (and), `||` (or), and `!` (not), with parentheses for grouping - e.g. `water && !flying`, `(steel || rock) && spe>100`.
-- Stat comparisons for any of the six base stats: `spe>100`, `atk>=125`, `def<80`, etc.
+- Stat comparisons for any of the six base stats: `spe>100`, `atk>=125`, `def<80`, `spa=90`, etc.
 - Search by ability, type, or move in the same expression - e.g. `water && fake out` finds Water-types that can learn Fake Out.
 - Multi-word ability and move names work as single terms (`clear body`, `fake out`) without needing quotes.
 - Type "Mega" or "Gmax" as their own term to filter to just those forms - e.g. `mega` on its own, or `fire && mega` for Mega fire-types.
-- Clicking any of Showdown's own suggestions (type, ability, move, whatever's showing) inserts it into your query instead of immediately searching, so you can keep building a compound expression. Autocomplete keeps working normally for every term you type, not just the first one.
+- Clicking any of Showdown's own suggestions (type, ability, move) inserts it into your query instead of immediately searching, so you can keep building a compound expression. Autocomplete keeps working normally for every term you type, not just the first one. Clicking a specific Pokémon name is the exception - that uses Showdown's normal, default behavior rather than being inserted into the query.
 - Press Enter to commit the whole expression as a filter chip, same as a native Showdown filter.
 - A completely plain, single-term search (just a name, no special syntax) is untouched - Showdown's own native search handles it exactly as before.
 - Toggle in Options → Teambuilder → **"Use advanced Teambuilder search"** (on by default). Turning it off restores Showdown's completely default search behavior.
