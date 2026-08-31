@@ -2089,7 +2089,7 @@
 	// handle everything, completely unmodified.
 	(function () {
 		var STAT_NAMES = ['hp', 'atk', 'def', 'spa', 'spd', 'spe'];
-		var COMPARISON_OPS = ['>=', '<=', '==', '>', '<'];
+		var COMPARISON_OPS = ['>=', '<=', '==', '=', '>', '<'];
 
 		// The real getQolPref/setQolPref live in the separate "Showdown
 		// Battle Update" section's own IIFE, which - unlike what was
@@ -2161,7 +2161,7 @@
 		}
 
 		function tokenize(query) {
-			var pattern = /\s*(&&|\|\||!|\(|\)|>=|<=|==|>|<|[a-zA-Z0-9]+(?:\s+[a-zA-Z0-9]+)*)\s*/g;
+			var pattern = /\s*(&&|\|\||!|\(|\)|>=|<=|==|=|>|<|[a-zA-Z0-9]+(?:\s+[a-zA-Z0-9]+)*)\s*/g;
 			var tokens = [];
 			var match, lastIndex = 0;
 			while ((match = pattern.exec(query)) !== null) {
@@ -2260,7 +2260,7 @@
 						case '<': return actual < node.value;
 						case '>=': return actual >= node.value;
 						case '<=': return actual <= node.value;
-						case '==': return actual === node.value;
+						case '==': case '=': return actual === node.value;
 					}
 					return false;
 				case 'word':
@@ -2287,7 +2287,7 @@
 
 		function looksLikeAdvancedQuery(query) {
 			if (/&&|\|\||!/.test(query)) return true;
-			if (new RegExp('\\b(' + STAT_NAMES.join('|') + ')\\s*(>=|<=|==|>|<)').test(query.toLowerCase())) return true;
+			if (new RegExp('\\b(' + STAT_NAMES.join('|') + ')\\s*(>=|<=|==|=|>|<)').test(query.toLowerCase())) return true;
 			var trimmed = query.trim().toLowerCase();
 			if (trimmed === 'mega' || trimmed === 'gmax') return true;
 			return false;
@@ -2474,6 +2474,14 @@
 			var inputEl = document.querySelector('input[name="pokemon"]');
 			if (!inputEl) return;
 			var entryParts = entryEl.dataset.entry.split('|');
+			// A specific Pokémon name is a selection (add this mon),
+			// not a reusable filter condition like a type or ability -
+			// clicking one should use Showdown's own default behavior
+			// completely untouched, not get inserted into the query.
+			if (entryParts[0] === 'pokemon') {
+				console.log('[AdvSearch] click: pokemon-category entry, letting Showdown handle this click normally -', entryEl.dataset.entry);
+				return;
+			}
 			var displayName = entryParts[1];
 			if (!displayName) return;
 			console.log('[AdvSearch] click: intercepted native suggestion click, data-entry =', entryEl.dataset.entry);
