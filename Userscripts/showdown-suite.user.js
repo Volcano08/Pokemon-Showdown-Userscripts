@@ -2576,6 +2576,19 @@
 			if (!liveSearch || !liveSearch.el || !liveSearch.el.contains(entryEl)) return;
 			var inputEl = document.querySelector('input[name="pokemon"]');
 			if (!inputEl) return;
+			// win.search is a single, shared global that Showdown
+			// reassigns whenever a different search-powered field
+			// (Ability, Moves, Item) gets activated - without checking
+			// that this specific live search instance is genuinely tied
+			// to the Pokemon-name box (via its own $inputEl), clicking a
+			// suggestion in one of those other fields was incorrectly
+			// redirected into the Pokemon search box instead of that
+			// field's own native behavior.
+			var boundInputEl = liveSearch.$inputEl && liveSearch.$inputEl[0];
+			if (boundInputEl !== inputEl) {
+				console.log('[AdvSearch] click: live search is bound to a different input (Ability/Moves/Item field, not the Pokemon search box) - letting it handle this click normally');
+				return;
+			}
 			var entryParts = entryEl.dataset.entry.split('|');
 			// A specific Pokémon name is a selection (add this mon),
 			// not a reusable filter condition like a type or ability -
