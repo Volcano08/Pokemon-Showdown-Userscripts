@@ -1998,6 +1998,109 @@
 				showFolderPicker(btn);
 			});
 			validateBtn.insertAdjacentElement('afterend', btn);
+
+			// Whole-team LabMaus lookup, right next to Folder. Confirmed
+			// URL structure: labmaus.net/teams/discover?regulation=...
+			// &pokemon_filter=[{"pokemon":"Species","item":"Item"},...].
+			// The regulation string (e.g. "Regulation Set M-B") is a
+			// best-effort guess from Showdown's internal format id
+			// (...regmb -> "Regulation Set M-B") - not independently
+			// confirmed against the live site beyond the one example
+			// URL provided, since the site blocks automated fetching.
+			if (document.getElementById('qol2-labmaus-team-btn')) return;
+			var labmausTeamBtn = document.createElement('button');
+			labmausTeamBtn.id = 'qol2-labmaus-team-btn';
+			labmausTeamBtn.className = 'button';
+			labmausTeamBtn.title = 'Find similar teams on LabMaus';
+			var labmausTeamIcon = document.createElement('img');
+			labmausTeamIcon.src = 'https://favicon.im/labmaus.net';
+			labmausTeamIcon.style.cssText = 'width:14px;height:14px;vertical-align:middle;image-rendering:auto;margin-right:4px;';
+			labmausTeamIcon.onerror = function () { this.style.display = 'none'; };
+			labmausTeamBtn.appendChild(labmausTeamIcon);
+			labmausTeamBtn.appendChild(document.createTextNode('LabMaus Team'));
+			labmausTeamBtn.addEventListener('click', function (e) {
+				e.stopPropagation();
+				var tbRoom = win.app && win.app.rooms && win.app.rooms['teambuilder'];
+				if (!tbRoom || !tbRoom.curSetList) return;
+				var pokemonFilter = tbRoom.curSetList.filter(function (set) { return set && set.species; }).map(function (set) {
+					var speciesData = (win.Dex && win.Dex.species) ? win.Dex.species.get(set.species) : null;
+					// Mega-evolved formes (Charizard-Mega-Y, etc) are
+					// stored as the already-evolved forme name in
+					// curSetList, but LabMaus's own team submissions use
+					// the base species name with the mega stone as the
+					// item - confirmed directly against the working
+					// example (plain "Charizard" + "Charizardite Y").
+					var speciesName = (speciesData && speciesData.isMega && speciesData.baseSpecies) ? speciesData.baseSpecies : set.species;
+					// Floette-Eternal is a special case: it's the
+					// canonical forme name itself (the only Floette
+					// variant that can mega-evolve at all), not a
+					// "-Mega"-suffixed name like Charizard-Mega-Y, so its
+					// own formeid doesn't contain "mega" and the general
+					// isMega check above never catches it. Confirmed
+					// directly: the working example needs plain
+					// "Floette" + "Floettite", same pattern as Charizard.
+					if (String(set.species).toLowerCase().replace(/[^a-z]/g, '') === 'floetteeternal') speciesName = 'Floette';
+					// The gender symbol is only needed when a genuine
+					// alternate-gender counterpart species actually exists
+					// to disambiguate from (Basculegion and Basculegion-F
+					// both exist as separate, selectable species) - not
+					// simply whenever a species happens to be gender-locked.
+					// Floette (all color variants) is genuinely female-only
+					// in the real games, same as its whole Flabébé/Florges
+					// line, with no male counterpart existing at all, so
+					// there's nothing to disambiguate and the symbol was
+					// wrongly appearing despite being factually accurate
+					// (checking gender-locked status alone isn't the right
+					// signal; checking for a genuine counterpart is).
+					var finalSpeciesData = (speciesName === set.species) ? speciesData : ((win.Dex && win.Dex.species) ? win.Dex.species.get(speciesName) : null);
+					if (finalSpeciesData && finalSpeciesData.gender) {
+						var baseId = speciesName.toLowerCase().replace(/[^a-z0-9]/g, '');
+						var counterpart = (win.Dex && win.Dex.species) ? win.Dex.species.get(baseId + 'f') : null;
+						// Confirmed directly: species.get() on a genuinely
+						// nonexistent id (e.g. "floettef") silently falls
+						// back to the closest real match (plain "floette"
+						// itself, with exists:true) rather than returning
+						// {exists:false} - checking exists alone isn't
+						// enough. Comparing the returned entry's own id
+						// against what was actually queried for correctly
+						// distinguishes a genuine distinct species
+						// (Basculegion-F, id genuinely "basculegionf") from
+						// a fallback to something else entirely.
+						if (counterpart && counterpart.exists && counterpart.id === baseId + 'f') {
+							speciesName += finalSpeciesData.gender === 'M' ? ' \u2642' : ' \u2640';
+						}
+					}
+					var entry = { pokemon: speciesName };
+					if (set.item) entry.item = set.item;
+					return entry;
+				});
+				var formatId = (tbRoom.curTeam && tbRoom.curTeam.format) || '';
+				var regMatch = /reg([a-z]+)$/i.exec(formatId);
+				var regulation = regMatch ? 'Regulation Set ' + regMatch[1].toUpperCase().split('').join('-') : '';
+
+				// Confirmed required: omitting date_range entirely was
+				// the actual cause of "no teams matching" (not the
+				// pokemon_filter or regulation, which were already
+				// correct) - LabMaus's own search appears to need an
+				// explicit range rather than defaulting to all-time.
+				// Rolling 14-day window, matching the confirmed working
+				// example's span (2026-08-18 to 2026-09-01), computed
+				// fresh from today rather than hardcoded.
+				function toDateStr(d) {
+					return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+				}
+				var today = new Date();
+				var twoWeeksAgo = new Date(today);
+				twoWeeksAgo.setDate(today.getDate() - 14);
+				var dateRange = toDateStr(twoWeeksAgo) + ' to ' + toDateStr(today);
+
+				var params = new URLSearchParams();
+				params.set('date_range', dateRange);
+				if (regulation) params.set('regulation', regulation);
+				params.set('pokemon_filter', JSON.stringify(pokemonFilter));
+				GM_openInTab('https://labmaus.net/teams/discover?' + params.toString(), { active: true, insert: true });
+			});
+			btn.insertAdjacentElement('afterend', labmausTeamBtn);
 		}
 
 		// ─── TeamPopup patch ───
@@ -2641,6 +2744,100 @@
 	})();
 
 	// ============================================================
+	// TEAMBUILDER SET-PANEL BUTTON CLEANUP
+	// ============================================================
+	// Hides Copy, Import/Export, Move, and Delete specifically on the
+	// same set panel where the Teambuilder quick-links feature (further
+	// below, a separate section/scope) adds its Serebii/MunchStats/NCP
+	// buttons - not on every .setmenu on the page, since Teambuilder can
+	// show several at once (one per team member) and only this one
+	// specific one should be affected. Deliberately self-contained
+	// (duplicating the same element-finding approach patchTeambuilderLinks
+	// uses) rather than calling into that other section's function,
+	// since sections here are genuinely separate scopes - a function
+	// defined in one is not reachable from another.
+	// "Stats" on this panel is a <label>, not a button, so it's
+	// untouched either way.
+	//
+	// Uses unsafeWindow (not plain window) since userscripts run in an
+	// isolated JS context - plain window here is not the same object
+	// the page's own scripts (including Showdown's app) set properties
+	// on, confirmed directly against the live environment.
+	//
+	// A MutationObserver re-applies this instantly whenever Showdown
+	// re-renders the panel, rather than polling on a fixed interval -
+	// polling left a brief flash of the buttons visible each time you
+	// switched between team members, confirmed directly in testing.
+	(function () {
+		var observedEl = null;
+		var observer = null;
+
+		// Self-contained (matching the same reasoning as isAdvancedSearchEnabled
+		// elsewhere) since getQolPref lives in a different section's own,
+		// separate scope and genuinely isn't reachable from here.
+		function isQuickLinksEnabled() {
+			try {
+				var p = JSON.parse(localStorage.getItem('qol2-settings') || '{}');
+				return ('tbquicklinks' in p) ? p.tbquicklinks : false;
+			} catch (e) { return false; }
+		}
+
+		function hideSetMenuButtons() {
+			var tbRoom = unsafeWindow.app && unsafeWindow.app.rooms && unsafeWindow.app.rooms['teambuilder'];
+			if (!tbRoom) return;
+			var el = tbRoom.el || (tbRoom.$el && tbRoom.$el[0]);
+			if (!el) return;
+
+			if (el !== observedEl) {
+				if (observer) observer.disconnect();
+				observedEl = el;
+				observer = new MutationObserver(hideSetMenuButtons);
+				observer.observe(el, { childList: true, subtree: true });
+			}
+
+			// Matches the same guard patchTeambuilderLinks uses: only
+			// once a specific Pokemon is expanded into full detail (not
+			// the compact, all-members-stacked overview), since that's
+			// the only context quick-links itself ever activates in -
+			// confirmed directly against the live environment that the
+			// two are genuinely different rendering contexts.
+			if (!tbRoom.curSet || !tbRoom.curSet.species) return;
+
+			var menus = el.querySelectorAll('.setmenu');
+			var menu = null;
+			for (var i = 0; i < menus.length; i++) {
+				if (menus[i].querySelector('button[name="copySet"]')) { menu = menus[i]; break; }
+			}
+			if (!menu) return;
+
+			// Only hide these native buttons when quick-links are
+			// themselves enabled - otherwise nothing is taking their
+			// place, so hiding them would just leave an empty gap with
+			// no useful controls at all. Actively restores them (not
+			// just skips hiding) so turning the setting off mid-session
+			// immediately brings back whatever was already hidden.
+			var quickLinksOn = isQuickLinksEnabled();
+			['copySet', 'importSet', 'moveSet', 'deleteSet'].forEach(function (name) {
+				var btn = menu.querySelector('button[name="' + name + '"]');
+				if (!btn) return;
+				if (quickLinksOn) {
+					if (btn.style.display !== 'none') btn.style.display = 'none';
+				} else {
+					if (btn.style.display === 'none') btn.style.display = '';
+				}
+			});
+		}
+
+		// Retries until the teambuilder room exists at all (e.g. before
+		// Teambuilder has ever been opened) - once found, the observer
+		// attached above takes over for instant reaction to every
+		// subsequent re-render, so this interval no longer needs to be
+		// frequent.
+		setInterval(hideSetMenuButtons, 1000);
+		hideSetMenuButtons();
+	})();
+
+	// ============================================================
 	// SHOWDOWN BATTLE UPDATE
 	// ============================================================
 	(function () {
@@ -3271,7 +3468,7 @@
 					if (menus[i].querySelector('button[name=copySet]')) { menu = menus[i]; break; }
 				}
 				if (!menu) return;
-				if (menu.querySelector('#qol2-tb-links')) return;
+				if (menu.parentNode && menu.parentNode.querySelector('#qol2-tb-links')) return;
 				injectQuickLinks(menu, tbRoom.curSet, tbRoom.curTeam);
 			}, 300);
 		}
@@ -3289,9 +3486,29 @@
 			var setExport = exportSetToShowdownText(set);
 			if (teamName) setExport = '=== ' + teamName + ' ===\n' + setExport;
 
-			var wrap = document.createElement('span');
+			// Confirmed pattern: labmaus.net/pokemon/{nationalDexNumber}
+			// (e.g. /pokemon/445 is Garchomp, matching its actual
+			// National Dex number) - computed from the species' own
+			// num, not baseSpecies, since National Dex numbers are
+			// shared across formes of the same species anyway.
+			var natDexNum = (win.Dex && win.Dex.species) ? win.Dex.species.get(species).num : null;
+			var labmausUrl = natDexNum ? 'https://labmaus.net/pokemon/' + natDexNum : 'https://labmaus.net/';
+
+			// A separate sibling using Showdown's own native
+			// .setmenu-left class (already used elsewhere, e.g. the
+			// "Undo Delete" button) rather than inserting into the
+			// original, right-aligned .setmenu - keeps these pinned to
+			// the left edge independently, leaving the right side of
+			// the panel free.
+			var wrap = document.createElement('div');
 			wrap.id = 'qol2-tb-links';
-			wrap.style.cssText = 'display:inline-flex;gap:3px;vertical-align:middle;';
+			wrap.className = 'setmenu setmenu-left';
+			// .setmenu-left's native left:5px sits at the panel's raw
+			// edge, crowding the sprite/nickname area - overriding to
+			// 130px instead, matching the original .setmenu's own left
+			// offset (confirmed in the source CSS), so these start
+			// right where the button-row area actually begins.
+			wrap.style.cssText = 'display:inline-flex;gap:3px;left:130px;';
 
 			function makeBtn(label, faviconUrl, onClick) {
 				var b = document.createElement('button');
@@ -3310,6 +3527,7 @@
 
 			wrap.appendChild(makeBtn('Serebii', 'https://favicon.im/serebii.net', function () { GM_openInTab(serebiiUrl, { active: true, insert: true }); }));
 			wrap.appendChild(makeBtn('MunchStats', 'https://favicon.im/munchstats.com', function () { GM_openInTab(munchUrl, { active: true, insert: true }); }));
+			wrap.appendChild(makeBtn('LabMaus', 'https://favicon.im/labmaus.net', function () { GM_openInTab(labmausUrl, { active: true, insert: true }); }));
 			wrap.appendChild(makeBtn('NCP Calc+Copy', 'https://favicon.im/nimbasacitypost.com', function () {
 				var payload = encodeURIComponent(JSON.stringify({
 					set: setExport,
@@ -3319,12 +3537,7 @@
 				GM_openInTab(calcUrl + '#qol2=' + payload, { active: true, insert: true });
 			}));
 
-			var firstBtn = menu.querySelector('button');
-			if (firstBtn) {
-				menu.insertBefore(wrap, firstBtn);
-			} else {
-				menu.appendChild(wrap);
-			}
+			if (menu.parentNode) menu.parentNode.insertBefore(wrap, menu);
 		}
 
 		(function hookFocusRoom() {
