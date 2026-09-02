@@ -95,6 +95,7 @@ If either message is missing, the script isn't running on that page. Check that 
 - The all-teams view groups everything sensibly: pinned folder(s) first, then other folders alphabetically, then a "No Folder" separator, then unfoldered teams last.
 - Subfolders show indented under their parent in the sidebar.
 - The battle team-selector popup (when choosing a team to bring into a match) shows folder names properly indented for subfolders instead of the full "Parent/Child" path.
+- A **LabMaus Team** button sits next to Folder, opening a LabMaus search pre-filled with your current team's Pokémon and held items, to find similar top tournament teams for your format.
 
 ### Advanced Teambuilder Search
 
@@ -118,7 +119,7 @@ Adds boolean logic, stat filters, and a few other conveniences to the Pokémon s
 - **Auto-copy replay link**: copies the replay URL to your clipboard when a battle ends.
 - **Auto-close battle after replay is copied**: closes the room a few seconds after the battle ends, giving you time to see the result first.
 - **Close battle after forfeiting**: closes the room automatically if you forfeit (on by default).
-- **Teambuilder quick-links**: adds Serebii / MunchStats / NCP Calc+Copy buttons next to Copy Set in the Teambuilder (see below).
+- **Teambuilder quick-links**: adds Serebii / MunchStats / LabMaus / NCP Calc+Copy buttons, positioned at the left edge of the per-Pokémon editor panel. While enabled, the native Copy/Import-Export/Move/Delete buttons are hidden there to make room (turning the setting off restores them).
 - **Modes** (mutually exclusive, turning one on turns the others off):
   - **Default Mode**: normal behavior, nothing automated beyond the toggles above.
   - **Battle Mode**: repeatedly searches your current format automatically, with a floating widget tracking your battle/series count and replays saved. Correctly counts a Best-of-3 match as *one* series rather than 2–3 separate battles. Pause/Resume/End controls, plus an Export Replays button that downloads a `.txt` of all saved links.
