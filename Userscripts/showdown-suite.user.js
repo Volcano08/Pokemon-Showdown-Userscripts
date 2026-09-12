@@ -1396,9 +1396,29 @@
 							byFolder[it.teamFolder].push(it);
 						});
 
-						var pins = getPinned().filter(function (p) { return byFolder[p]; });
-						var others = folderOrder.filter(function (f) { return pins.indexOf(f) === -1; }).sort();
-						var orderedFolders = pins.concat(others);
+						var allPaths = getAllFolderPaths();
+						var pins = getPinned().filter(function (p) { return byFolder[p] || allPaths.indexOf(p) !== -1; });
+
+						// A pin can be an implicit parent (no teams
+						// directly in it, e.g. everything lives one level
+						// deeper in a subfolder) - its genuine child
+						// folders (which do have teams) get grouped
+						// directly underneath it here, rather than left
+						// to appear separately, later, among the
+						// alphabetically-sorted "others".
+						var pinnedChildren = {};
+						pins.forEach(function (p) {
+							pinnedChildren[p] = folderOrder.filter(function (f) { return f !== p && f.indexOf(p + '/') === 0; });
+						});
+						var allPinnedChildNames = [].concat.apply([], pins.map(function (p) { return pinnedChildren[p]; }));
+
+						var others = folderOrder.filter(function (f) { return pins.indexOf(f) === -1 && allPinnedChildNames.indexOf(f) === -1; }).sort();
+						var orderedFolders = [];
+						pins.forEach(function (p) {
+							orderedFolders.push(p);
+							orderedFolders = orderedFolders.concat(pinnedChildren[p]);
+						});
+						orderedFolders = orderedFolders.concat(others);
 
 						var stripPrefix = function (it) {
 							for (var n = it.teamDiv.firstChild; n; n = n.nextSibling) {
@@ -1424,10 +1444,12 @@
 								if (tb && tb.selectFolder) tb.selectFolder(folderName + '/');
 							});
 							frag.appendChild(header);
-							byFolder[folderName].forEach(function (it) {
-								stripPrefix(it);
-								frag.appendChild(it.li);
-							});
+							if (byFolder[folderName]) {
+								byFolder[folderName].forEach(function (it) {
+									stripPrefix(it);
+									frag.appendChild(it.li);
+								});
+							}
 						});
 						if (unfoldered.length && orderedFolders.length) {
 							var noFolderLabel = document.createElement('li');
@@ -1622,7 +1644,7 @@
 			});
 
 			var pins = getPinned().filter(function (p) {
-				return namedRows.some(function (r) { return r.name === p; });
+				return namedRows.some(function (r) { return r.name === p; }) || getAllFolderPaths().indexOf(p) !== -1;
 			});
 			if (!pins.length) return;
 
@@ -1661,9 +1683,28 @@
 
 			pins.forEach(function (name) {
 				var row = namedRows.find(function (r) { return r.name === name; });
-				if (!row) return;
-				insertAfter(row.div, anchor);
-				anchor = row.div;
+				var rowDiv;
+				if (row) {
+					rowDiv = row.div;
+				} else {
+					// Implicit parent - e.g. every team under this
+					// folder actually lives in a subfolder of it, so
+					// Showdown's own native list (which only ever
+					// creates rows for teams' exact, complete folder
+					// strings) never creates a row for the parent
+					// itself. Built here matching the same shape as a
+					// regular row, with the data-value Showdown's own
+					// delegated click handling already expects.
+					rowDiv = document.createElement('div');
+					rowDiv.className = 'folder';
+					var sf = document.createElement('div');
+					sf.className = 'selectFolder';
+					sf.setAttribute('data-value', name + '/');
+					sf.innerHTML = '<i class="fa fa-folder-o"></i> ' + esc(folderDisplayName(name));
+					rowDiv.appendChild(sf);
+				}
+				insertAfter(rowDiv, anchor);
+				anchor = rowDiv;
 				getSubRowsFor(name).forEach(function (subRow) {
 					insertAfter(subRow, anchor);
 					anchor = subRow;
@@ -2148,6 +2189,8 @@
 		function startObservingFolders() {
 			if (!win.Storage || !win.app) { setTimeout(startObservingFolders, 300); return; }
 
+			console.log('[PinnedDebug3] startObservingFolders running. whenTeamsLoaded exists:', !!win.Storage.whenTeamsLoaded, '| isLoaded:', win.Storage.whenTeamsLoaded && win.Storage.whenTeamsLoaded.isLoaded, '| Storage.teams count right now:', (win.Storage.teams || []).length, '| getPinned():', JSON.stringify(getPinned()));
+
 			function tryPatch() {
 				patchUpdateFolderList();
 				var tbNow = win.app.rooms && win.app.rooms['teambuilder'];
@@ -2163,6 +2206,30 @@
 			tryPatch();
 			injectButton();
 			tryPatchTeamPopup();
+
+			// Storage.whenTeamsLoaded is Showdown's own, canonical load
+			// tracker for exactly this: it fires the callback once teams
+			// have genuinely finished loading (or immediately, if
+			// already loaded by this point). This replaces an earlier,
+			// much more fragile approach that tried to guess the right
+			// moment via MutationObserver retries.
+			if (win.Storage.whenTeamsLoaded) {
+				win.Storage.whenTeamsLoaded(function () {
+					console.log('[PinnedDebug3] whenTeamsLoaded callback FIRED. Storage.teams count:', (win.Storage.teams || []).length, '| folder names present:', JSON.stringify((win.Storage.teams || []).map(function (t) { return t.folder; }).filter(Boolean)));
+					if (getVisibleFolderpane()) enhanceSidebar();
+					var tb = win.app.rooms && win.app.rooms['teambuilder'];
+					if (tb && getVisibleTeampane()) enhanceTeamList(tb);
+				});
+			} else {
+				console.log('[PinnedDebug3] win.Storage.whenTeamsLoaded does NOT exist at all');
+			}
+
+			// Extra check: does Storage.teams keep changing well after
+			// whenTeamsLoaded fired? If so, that tracker isn't actually
+			// the complete signal I assumed it was.
+			setTimeout(function () {
+				console.log('[PinnedDebug3] 3s after startObservingFolders: Storage.teams count:', (win.Storage.teams || []).length, '| folder names present:', JSON.stringify((win.Storage.teams || []).map(function (t) { return t.folder; }).filter(Boolean)));
+			}, 3000);
 
 			new MutationObserver(function () {
 				if (document.querySelector('li.format-select button[name="validate"]')) injectButton();
@@ -4305,5 +4372,5 @@
   }
 `);
 
-	console.log('[Showdown Suite] v1.2.0 loaded - Music, QoL, Move to Folder, Battle Update, OTS Pokepaste Modifier, Text Size, Rainbow Buttons.');
+	console.log('[Showdown Suite] v1.2.0 (build: pin-fix-debug3) loaded - Music, QoL, Move to Folder, Battle Update, OTS Pokepaste Modifier, Text Size, Rainbow Buttons.');
 })();
