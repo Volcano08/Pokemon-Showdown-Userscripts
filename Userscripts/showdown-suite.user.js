@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Showdown Suite (Merged)
 // @namespace    showdown-qol-suite
-// @version      1.2.0
+// @version      1.5.15
 // @description  All-in-one: custom music player, QoL shortcuts/avatar/room filter, teambuilder folders, battle/replay/OTS tools, OTS Pokepaste export modifier, adjustable text size, rainbow menu buttons.
 // @author       Volcano08
 // @match        https://play.pokemonshowdown.com/*
@@ -71,8 +71,7 @@
 	// repo converts/cleans/uploads audio files and generates entries in
 	// this exact format to paste in.
 	var MUSIC_TRACKS = [
-		// 'https://raw.githubusercontent.com/your-username/your-repo/refs/heads/main/your-folder/Example%20Song.mp3',
-	];
+];
 
 	// Showdown's own built-in battle music. Included in the shuffle pool by
 	// default alongside MUSIC_TRACKS; toggle in Options -> Music.
@@ -214,9 +213,29 @@
 			});
 		}
 
+		// New-client counterpart of isInActiveBattle() above (left untouched).
+		// PS.rooms entries have no native "battle ended" flag the way old
+		// client's room.battleEnded is - that's filled in by this script's own
+		// patchBattleRoomProtocolNewClient() handleLine hook (installed
+		// unconditionally at load, not behind any QoL preference) stamping
+		// room._qol2EndedAt once a |win|/|tie| protocol line arrives. Mirrors
+		// bmIsInBattleNewClient() elsewhere in this file, which solved this
+		// exact old-client-only-detection gap for the Battle Mode feature.
+		// Without this, isInActiveBattle() alone always returns false on the
+		// new client (win.app doesn't exist there), so playTrackNow() below
+		// never took its immediate-switch branch - clicking Play/Loop during
+		// a new-client battle silently armed forcedNext for "next battle"
+		// instead of switching the music that's actually playing right now.
+		function isInActiveBattleNewClient() {
+			if (!win.PS || !win.PS.rooms) return false;
+			return Object.values(win.PS.rooms).some(function (r) {
+				return r && r.classType === 'battle' && !r._qol2EndedAt;
+			});
+		}
+
 		function playTrackNow(url, loop) {
 			loopTrack = loop ? url : null;
-			if (isInActiveBattle() && win.__cmActiveAudio) {
+			if ((isInActiveBattle() || isInActiveBattleNewClient()) && win.__cmActiveAudio) {
 				win.__cmCurrentTrack = url;
 				win.__cmActiveAudio.src = url;
 				win.__cmActiveAudio.currentTime = 0;
@@ -727,8 +746,17 @@
 	// ============================================================
 	(function () {
 		// ─── AUTO-CLOSE NEWS POPUP ───
+		// Old client renders News as a .pm-window.news-embed popup with a
+		// .closebutton. The new client's News is a totally different UI
+		// paradigm - a dockable "mini-window" (same mechanism as a
+		// minimized battle/chat room) rather than a popup overlay - but it
+		// still carries a .closebutton in its own header
+		// (renderMiniRooms() in panel-mainmenu.tsx), tagged with
+		// data-roomid="news" since NewsPanel.id is 'news'. Trying the old
+		// selector first and falling back to the new one covers both
+		// without needing to branch on win.app/win.PS at all.
 		var closeNews = function () {
-			var newsWindow = document.querySelector('.pm-window.news-embed');
+			var newsWindow = document.querySelector('.pm-window.news-embed') || document.querySelector('.mini-window[data-roomid="news"]');
 			if (newsWindow) {
 				var closeBtn = newsWindow.querySelector('.closebutton');
 				if (closeBtn) closeBtn.click();
@@ -748,7 +776,16 @@
 		var closeProxyLockPopup = function () {
 			document.querySelectorAll('.ps-popup').forEach(function (popup) {
 				if (popup.textContent && popup.textContent.indexOf(PROXY_LOCK_TEXT) !== -1) {
-					var closeBtn = popup.querySelector('button[name="close"]');
+					// The new client's PopupPanel (what PS.alert() - the
+					// mechanism behind any plain server |popup| message -
+					// renders) has no button[name="close"] at all for a
+					// plain message-only alert like this one: just an "OK"
+					// button (type="submit", no name). Falling back to that
+					// covers the new client; it's only ever reached once
+					// the popup is already confirmed by its text to be the
+					// right one, so there's no risk of it matching some
+					// unrelated submit button elsewhere.
+					var closeBtn = popup.querySelector('button[name="close"]') || popup.querySelector('button[type="submit"]');
 					if (closeBtn) closeBtn.click();
 				}
 			});
@@ -823,6 +860,215 @@
 			clearInterval(initFormatTracking);
 		}, 300);
 
+		// ─── SAVE & RESTORE LAST FORMAT + TEAM (NEW CLIENT) ───
+		// New client identifies a saved team by its own stable string
+		// key (team.key), not an array index like the old client's
+		// curTeamIndex, so it gets its own storage key rather than
+		// reusing TEAM_INDEX_KEY/TEAM_FORMAT_KEY. FORMAT_KEY is shared
+		// across both clients since it's just a plain format string.
+		var NEWCLIENT_TEAM_KEY = 'qol_last_team_key';
+		var newClientFormatTeamWatcherAdded = false;
+
+		var findHomeRoomEl = function () {
+			// The home/main-menu room's container always has id
+			// "room-" (PSPanelWrapper renders id=`room-${room.id}`
+			// and the home room's id is the empty string). This is
+			// also what keeps us from ever matching a format/team
+			// button that belongs to an open teambuilder panel
+			// instead - those use the same "formatselect"/
+			// "teamselect" classes, but live under a container whose
+			// room id is never empty.
+			return document.getElementById('room-');
+		};
+
+		var findSearchFormatButton = function () {
+			var home = findHomeRoomEl();
+			if (!home) return null;
+			return home.querySelector('button[name="format"].formatselect:not([disabled])');
+		};
+
+		var findSearchTeamButton = function () {
+			var home = findHomeRoomEl();
+			if (!home) return null;
+			return home.querySelector('button[name="team"].teamselect:not([disabled])');
+		};
+
+		var setButtonValueAndFireChange = function (btn, value) {
+			if (!btn || btn.value === value) return false;
+			btn.value = value;
+			// FormatDropdown/TeamDropdown's change handler reads
+			// this.base.value directly, so a real dispatched change
+			// event triggers it exactly like a genuine selection.
+			btn.dispatchEvent(new Event('change', { bubbles: true }));
+			return true;
+		};
+
+		var FMT_LOG = '[Showdown Suite: FormatRestore]';
+
+		// Showdown's own format-picker popup (FormatDropdownPanel in
+		// panel-teamdropdown.tsx) sets its option buttons' values to the
+		// format's pretty display NAME (e.g. "[Gen 9 Champions] VGC 2026
+		// Reg M-C"), not its clean BattleFormats-keyed id (e.g.
+		// "gen9championsvgc2026regmc") - unlike its own team picker
+		// (TeamBox), which correctly uses the stable team.key. That
+		// pretty name is exactly the string our change listener below
+		// captures off the button's real .value and saves to
+		// localStorage, so savedFormat can legitimately BE a pretty
+		// name - confirmed from a real user's console log, it routinely
+		// is for any server/section with custom-named formats. Showdown's
+		// own code treats this as totally normal and always re-normalizes
+		// a dropdown's raw value before using it as a lookup key
+		// (FormatDropdownPanel.render()'s own `curFormat` computation,
+		// and PS.teams.teambuilderFormat()) via toID(), so we mirror that
+		// exact algorithm here - lowercase, strip everything but a-z0-9 -
+		// rather than comparing the raw string straight against
+		// win.BattleFormats, which always missed for any non-default
+		// format chosen through the normal popup flow and silently
+		// aborted the ENTIRE restore (format AND team, since team
+		// restoration is nested inside this same function). This
+		// normalization is ONLY for the existence check just below;
+		// savedFormat itself stays completely raw everywhere else (the
+		// button value, the reassert check, the log line, localStorage),
+		// matching exactly what a real interactive selection produces
+		// and what FormatDropdown/TeamForm already expect to receive.
+		// It's also a safe no-op for anyone whose saved value was
+		// already a clean id, since toID() of an already-clean id is
+		// just itself, unchanged.
+		var qolToID = function (text) {
+			return String(text).toLowerCase().replace(/[^a-z0-9]+/g, '');
+		};
+
+		var restoreFormatAndTeamNewClient = function () {
+			if (!win.PS) return false;
+			var savedFormat = localStorage.getItem(FORMAT_KEY);
+			if (!savedFormat) return false;
+			if (!win.BattleFormats || !win.BattleFormats[qolToID(savedFormat)]) {
+				return false;
+			}
+
+			var formatBtn = findSearchFormatButton();
+			if (!formatBtn) return false;
+
+			var changedFormat = setButtonValueAndFireChange(formatBtn, savedFormat);
+
+			var applyTeam = function () {
+				var savedTeamKey = localStorage.getItem(NEWCLIENT_TEAM_KEY);
+				if (!savedTeamKey) return;
+				var teamBtn = findSearchTeamButton();
+				if (!teamBtn) return;
+				setButtonValueAndFireChange(teamBtn, savedTeamKey);
+			};
+
+			// FormatDropdown's own change handler (which our dispatched
+			// event above triggers whenever changedFormat is true)
+			// schedules a deferred self-re-render of just itself. When
+			// that re-render runs, it reads `this.format = this.props.format
+			// || this.format || ...` - and since its enclosing TeamForm
+			// never actually re-renders from any of this (TeamForm.format
+			// is updated as a plain field, with nothing calling
+			// setState/forceUpdate on TeamForm itself), FormatDropdown's
+			// `props.format` is still the stale value from the very
+			// first mount. That stale truthy prop wins the `||` chain
+			// and silently reverts the button's displayed format back to
+			// the default, even though the format we actually want is
+			// correctly sitting in TeamForm.format (and is what a real
+			// search would submit) the whole time - it's only the
+			// visible button that gets clobbered back.
+			// That deferred re-render is a Promise microtask (confirmed
+			// against the actual js/lib/preact.min.js Showdown ships,
+			// not just the latest npm package), so it has always
+			// already run by the time a setTimeout(fn, 0) callback
+			// fires - which is the right moment to put the display back
+			// on, deliberately with a plain assignment and no
+			// re-dispatched 'change' event, since dispatching again
+			// would just trigger the same self-clobbering re-render a
+			// second time. Extra passes further out guard against a
+			// slow login/reconnect sequence (or anything else) landing
+			// an unrelated re-render in this same window; they're cheap
+			// no-ops whenever the display is already correct.
+			var reassertFormat = function () {
+				if (formatBtn && formatBtn.value !== savedFormat) {
+					formatBtn.value = savedFormat;
+				}
+			};
+
+			// The team button's own choices (and its default selection)
+			// depend on whichever format is currently selected, so if we
+			// just changed the format, give its re-render a tick to
+			// settle before touching the team button - otherwise we'd
+			// be applying the saved team key against the OLD format's
+			// team list.
+			if (changedFormat) {
+				setTimeout(function () { applyTeam(); reassertFormat(); }, 0);
+			} else {
+				applyTeam();
+			}
+			setTimeout(reassertFormat, 200);
+			setTimeout(reassertFormat, 1000);
+
+			return true;
+		};
+
+		var watchFormatAndTeamNewClient = function () {
+			if (newClientFormatTeamWatcherAdded) return true;
+			newClientFormatTeamWatcherAdded = true;
+
+			// There's no settable room-model property to intercept
+			// on the new client (unlike old client's curFormat/
+			// curTeamIndex/curTeamFormat), so instead we listen for
+			// the same native change events the dropdowns themselves
+			// fire, scoped to the home room so we never pick up a
+			// teambuilder panel's own format/team selectors.
+			document.addEventListener('change', function (e) {
+				var t = e.target;
+				if (!t || !t.classList || !t.name) return;
+				var home = findHomeRoomEl();
+				if (!home || !home.contains(t)) return;
+				if (t.name === 'format' && t.classList.contains('formatselect')) {
+					if (t.value) {
+						localStorage.setItem(FORMAT_KEY, t.value);
+					}
+				} else if (t.name === 'team' && t.classList.contains('teamselect')) {
+					if (t.value) {
+						localStorage.setItem(NEWCLIENT_TEAM_KEY, t.value);
+					}
+				}
+			}, true);
+
+			// Safety net: the listener above only captures an ACTIVE
+			// selection made during this session. If the format/team
+			// shown was already sitting there from earlier (e.g. a
+			// long-lived tab that never fired a fresh change event this
+			// session, or any other reason the picker's value didn't
+			// come from a 'change' event we saw), nothing above would
+			// ever have saved it, and a reload would fall back to the
+			// defaults even though "last used" clearly wasn't empty.
+			// Reading the buttons' actual current values directly as
+			// the page goes away guarantees whatever was really on
+			// screen gets saved, independent of how it got there.
+			var saveCurrentFormatAndTeam = function () {
+				var formatBtn = findSearchFormatButton();
+				if (formatBtn && formatBtn.value) localStorage.setItem(FORMAT_KEY, formatBtn.value);
+				var teamBtn = findSearchTeamButton();
+				if (teamBtn && teamBtn.value) localStorage.setItem(NEWCLIENT_TEAM_KEY, teamBtn.value);
+			};
+			window.addEventListener('beforeunload', saveCurrentFormatAndTeam);
+			window.addEventListener('pagehide', saveCurrentFormatAndTeam);
+
+			return true;
+		};
+
+		var initFormatTrackingNewClient = setInterval(function () {
+			if (!win.PS || !win.BattleFormats) return;
+			if (!findSearchFormatButton()) return;
+			restoreFormatAndTeamNewClient();
+			watchFormatAndTeamNewClient();
+			setTimeout(restoreFormatAndTeamNewClient, 500);
+			setTimeout(restoreFormatAndTeamNewClient, 1500);
+			setTimeout(restoreFormatAndTeamNewClient, 3000);
+			clearInterval(initFormatTrackingNewClient);
+		}, 300);
+
 		// ─── SHORTCUTS CHEATSHEET — press ` to show/hide ───
 		var createCheatsheet = function () {
 			if (document.getElementById('qol-cheatsheet')) return document.getElementById('qol-cheatsheet');
@@ -882,7 +1128,12 @@
 
 		// ─── KEYBOARD SHORTCUTS & TAB NAVIGATION ───
 		// Track which room was last focused for accurate arrow key navigation
+		// (old client only - new client's own win.PS.room is already kept
+		// accurate by PS itself, used directly in the arrow-key handler
+		// below, so this tracker has nothing to do there; bail out for
+		// good once win.PS shows up instead of retrying forever).
 		(function trackLastFocused() {
+			if (win.PS) return;
 			if (!win.app || !win.app.focusRoom) { setTimeout(trackLastFocused, 300); return; }
 			if (win.app._qolFocusTracked) return;
 			win.app._qolFocusTracked = true;
@@ -941,9 +1192,20 @@
 					document.body.focus();
 					var tabs = Array.from(document.querySelectorAll('.maintabbar .roomtab'));
 					if (!tabs.length) return;
-					if (!win.app) return;
+					if (!win.app && !win.PS) return;
 
-					var activeRoom = win.app._qolLastFocused || win.app.curRoom;
+					// New (Preact) client: .maintabbar/.roomtab markup and
+					// the href="/<roomid>" shape are both unchanged
+					// (confirmed directly in panel-topbar.tsx), so the
+					// tab-finding/click logic below needs no changes at
+					// all - the only old-client-specific part was getting
+					// the currently-focused room. win.PS.room is PS's own
+					// actively-maintained "current room" field (updated on
+					// every focus change, including popups/room-close
+					// fallbacks), so unlike old client's app.curRoom it
+					// doesn't need a separate _qolLastFocused click-tracker
+					// to stay accurate.
+					var activeRoom = win.app ? (win.app._qolLastFocused || win.app.curRoom) : win.PS.room;
 					var activeId = activeRoom ? activeRoom.id : '';
 
 					var curIdx = tabs.findIndex(function (t) {
@@ -969,18 +1231,34 @@
 			// modifier-driven character substitution.
 			if (e.code === 'KeyT' && (IS_MAC ? (e.metaKey && e.altKey) : (e.ctrlKey && e.altKey))) {
 				e.preventDefault();
+				// New (Preact) client: same idea, different global -
+				// win.app doesn't exist there at all, win.PS.join() is
+				// its tryJoinRoom (joins the room if not already open,
+				// then focuses it either way).
 				if (win.app) win.app.tryJoinRoom('teambuilder');
+				else if (win.PS) win.PS.join('teambuilder');
 				return;
 			}
 
 			if (isShortcutModifier(e)) {
 				switch (e.key.toLowerCase()) {
-					case 'h': e.preventDefault(); if (win.app) win.app.focusRoom(''); break;
-					case 'b': e.preventDefault(); if (win.app) win.app.tryJoinRoom('battles'); break;
-					case 'l': e.preventDefault(); if (win.app) win.app.tryJoinRoom('ladder'); break;
+					case 'h': e.preventDefault(); if (win.app) win.app.focusRoom(''); else if (win.PS) win.PS.focusRoom(''); break;
+					case 'b': e.preventDefault(); if (win.app) win.app.tryJoinRoom('battles'); else if (win.PS) win.PS.join('battles'); break;
+					case 'l': e.preventDefault(); if (win.app) win.app.tryJoinRoom('ladder'); else if (win.PS) win.PS.join('ladder'); break;
 					case 'f':
 						e.preventDefault();
-						var searchBtn = document.querySelector('.battleform button[name=search]');
+						// Old client's clickable Battle! button is
+						// button[name=search] inside .battleform - neither
+						// of those exist on the new client, where the
+						// equivalent is a plain type="submit" button
+						// (clicking it submits the enclosing <form
+						// onSubmit={submitSearch}>, same as a real click,
+						// using whatever format is currently selected).
+						// It's scoped to .mainmenu1.mainmenu.big - the one
+						// combination of classes this specific button uses
+						// anywhere in the client - so this can't accidentally
+						// match some unrelated submit button elsewhere.
+						var searchBtn = document.querySelector('.battleform button[name=search]') || document.querySelector('.mainmenu1.mainmenu.big.button[type="submit"]');
 						if (searchBtn) searchBtn.click();
 						break;
 					// Ctrl+Alt+M (music picker) is handled by the Custom Music section above.
@@ -992,6 +1270,33 @@
 		// ─── CUSTOM AVATAR ───
 		var applyCustomAvatar = function () {
 			if (!CUSTOM_AVATAR_URL) return;
+
+			// The modern (Preact) client - what play.pokemonshowdown.com
+			// actually serves by default, and what's in every screenshot
+			// we've debugged against - exposes everything through the
+			// global `PS` object (PS.user, PS.rooms). `win.app` is the old
+			// Backbone client's global and is simply undefined on the new
+			// client, which is why the two lookups below silently did
+			// nothing in battle/Bo3: `win.app && ...` short-circuited to
+			// false every time, with no error to notice. Checking PS first
+			// and falling back to `app` fixes the new client while still
+			// working if the legacy client (index-old.html/
+			// testclient-old.html) is ever loaded instead.
+			var getMyName = function () {
+				if (win.PS && win.PS.user) return win.PS.user.name;
+				if (win.app && win.app.user) return win.app.user.get('name');
+				return null;
+			};
+			var getAllRooms = function () {
+				if (win.PS && win.PS.rooms) return Object.values(win.PS.rooms);
+				if (win.app && win.app.rooms) return Object.values(win.app.rooms);
+				return [];
+			};
+			var getRoomById = function (roomid) {
+				if (win.PS && win.PS.rooms) return win.PS.rooms[roomid];
+				if (win.app && win.app.rooms) return win.app.rooms[roomid];
+				return null;
+			};
 
 			var replaceSprites = function () {
 				// Home screen: <img class="trainersprite yours"> (.yours = the logged-in user only)
@@ -1021,7 +1326,7 @@
 				// name in the row above instead. An opponent whose avatar
 				// hasn't resolved yet server-side will show as unknownf.png
 				// regardless of this code.
-				var myName = win.app && win.app.user && win.app.user.get('name');
+				var myName = getMyName();
 				if (myName) {
 					document.querySelectorAll('img.trainersprite').forEach(function (img) {
 						if (img.classList.contains('yours')) return; // handled above already
@@ -1042,8 +1347,9 @@
 				}
 
 				// Battle scene: .trainer-near is always the player's side (leftbar).
-				if (win.app && win.app.rooms) {
-					Object.values(win.app.rooms).forEach(function (room) {
+				var _rooms = getAllRooms();
+				if (_rooms.length) {
+					_rooms.forEach(function (room) {
 						if (!room || !room.battle || !room.request) return;
 						var scene = room.battle.scene;
 						var leftbar = scene && scene.$leftbar && scene.$leftbar[0];
@@ -1068,7 +1374,7 @@
 					orig.call(this);
 					if (!this.battle || !this.$leftbar) return;
 					var b = this.battle;
-					var room = win.app && win.app.rooms && win.app.rooms[b.roomid];
+					var room = getRoomById(b.roomid);
 					if (!room || !room.request) return;
 					this.$leftbar[0].querySelectorAll('.trainersprite').forEach(function (div) {
 						div.style.backgroundImage = 'url(' + CUSTOM_AVATAR_URL + ')';
@@ -1151,9 +1457,40 @@
 			};
 		};
 
+		// New client's Rooms panel was redesigned (search box +
+		// section dropdown) and dropped the old toggle button
+		// entirely, so we add our own. Anchored right after the <p>
+		// that wraps input[name="roomsearch"] - that element is
+		// always rendered regardless of search/filter state, unlike
+		// the individual .roomlist section divs further down, which
+		// come and go depending on what's been searched for.
+		var ensureShowMoreRoomsButton = function () {
+			if (win.app) return; // old client already has its own native button
+			if (document.getElementById('qol2-showmorerooms')) return;
+			var searchInput = document.querySelector('input[name="roomsearch"]');
+			if (!searchInput) return;
+			var anchor = searchInput.closest('p');
+			if (!anchor) return;
+
+			var wrap = document.createElement('p');
+			var btn = document.createElement('button');
+			btn.className = 'button';
+			btn.id = 'qol2-showmorerooms';
+			btn.textContent = roomFilterEnabled ? 'Show more rooms' : 'Hide more rooms';
+			btn.addEventListener('click', function () {
+				roomFilterEnabled = !roomFilterEnabled;
+				btn.textContent = roomFilterEnabled ? 'Show more rooms' : 'Hide more rooms';
+				filterRoomList();
+			});
+			wrap.appendChild(btn);
+
+			anchor.insertAdjacentElement('afterend', wrap);
+		};
+
 		var roomListObserver = new MutationObserver(function () {
 			hookToggleMoreRooms();
 			filterRoomList();
+			ensureShowMoreRoomsButton();
 		});
 		var observeRoomList = function () {
 			document.querySelectorAll('.roomlist').forEach(function (el) {
@@ -1161,6 +1498,7 @@
 			});
 			hookToggleMoreRooms();
 			filterRoomList();
+			ensureShowMoreRoomsButton();
 		};
 
 		new MutationObserver(function () {
@@ -2189,7 +2527,6 @@
 		function startObservingFolders() {
 			if (!win.Storage || !win.app) { setTimeout(startObservingFolders, 300); return; }
 
-			console.log('[PinnedDebug3] startObservingFolders running. whenTeamsLoaded exists:', !!win.Storage.whenTeamsLoaded, '| isLoaded:', win.Storage.whenTeamsLoaded && win.Storage.whenTeamsLoaded.isLoaded, '| Storage.teams count right now:', (win.Storage.teams || []).length, '| getPinned():', JSON.stringify(getPinned()));
 
 			function tryPatch() {
 				patchUpdateFolderList();
@@ -2215,20 +2552,17 @@
 			// moment via MutationObserver retries.
 			if (win.Storage.whenTeamsLoaded) {
 				win.Storage.whenTeamsLoaded(function () {
-					console.log('[PinnedDebug3] whenTeamsLoaded callback FIRED. Storage.teams count:', (win.Storage.teams || []).length, '| folder names present:', JSON.stringify((win.Storage.teams || []).map(function (t) { return t.folder; }).filter(Boolean)));
 					if (getVisibleFolderpane()) enhanceSidebar();
 					var tb = win.app.rooms && win.app.rooms['teambuilder'];
 					if (tb && getVisibleTeampane()) enhanceTeamList(tb);
 				});
 			} else {
-				console.log('[PinnedDebug3] win.Storage.whenTeamsLoaded does NOT exist at all');
 			}
 
 			// Extra check: does Storage.teams keep changing well after
 			// whenTeamsLoaded fired? If so, that tracker isn't actually
 			// the complete signal I assumed it was.
 			setTimeout(function () {
-				console.log('[PinnedDebug3] 3s after startObservingFolders: Storage.teams count:', (win.Storage.teams || []).length, '| folder names present:', JSON.stringify((win.Storage.teams || []).map(function (t) { return t.folder; }).filter(Boolean)));
 			}, 3000);
 
 			new MutationObserver(function () {
@@ -2239,6 +2573,924 @@
 		}
 
 		startObservingFolders();
+	})();
+
+	// ============================================================
+	// SHOWDOWN MOVE TO FOLDER - new (Preact) client
+	// ============================================================
+	// Mirrors the section above, function-for-function, targeting the
+	// newer Preact Teambuilder (room "teambuilder" -> panel-teambuilder.tsx
+	// for the folder/team list, room "team-<key>" -> panel-teambuilder-team.tsx
+	// for a single open team) instead of the jQuery one. Kept fully
+	// separate rather than merged into the functions above, matching
+	// this file's own convention of self-contained sections - and
+	// because the two clients differ enough (teams keyed by team.key
+	// instead of array index, no PromptPopup/Storage globals, no
+	// li.format-select/.setmenu wrapper) that sharing code would mean
+	// client-detection branches scattered through nearly every function
+	// anyway. Pins are stored under the same PREFS_KEY, so a folder
+	// pinned on one client stays pinned on the other.
+	//
+	// Full parity with the old-client version above: pinning, per-team
+	// folder assignment (including creating a new subfolder), the
+	// sidebar/team-list subfolder display, the "Open folder" and "move
+	// this folder into another folder" reorganizer per-team dropdown
+	// actions, the child-folder quick-nav shown inside a subfolder's own
+	// team list, the ancestor breadcrumb shown in a nested subfolder's
+	// own header, and the folder-divider headers grouping the flat "All
+	// teams" list are all here.
+	(function () {
+		function isNewClient() { return !!(win.PS && win.PS.rooms); }
+
+		var PREFS_KEY = 'ps-folder-ui';
+
+		// PS.prefs.set(key, val) writes into PS.prefs.storage[key] (the
+		// plain object that actually gets JSON.stringify'd to the
+		// "showdown_prefs" localStorage entry) AND mirrors it onto
+		// PS.prefs[key] directly, so reading PS.prefs[key] looks right
+		// for the rest of the current session. But on the NEXT page
+		// load, PSPrefs's constructor reloads "showdown_prefs" and only
+		// copies back the handful of keys it already knows about as
+		// named class fields (PSPrefsDefaults) - an arbitrary custom
+		// key like ours never gets re-mirrored onto the top level, even
+		// though it's sitting right there in .storage the whole time.
+		// So PS.prefs[PREFS_KEY] silently goes back to undefined after
+		// every reload while the real data survives untouched in
+		// PS.prefs.storage[PREFS_KEY] - which is why pins "worked" all
+		// session but reset on refresh. Reading from .storage directly
+		// is correct in both cases (immediately after .set(), and after
+		// a fresh reload), so that's the only place to read from.
+		function getPrefs() {
+			if (!win.PS.prefs) return { pins: [] };
+			var v = win.PS.prefs.storage && win.PS.prefs.storage[PREFS_KEY];
+			return (v && typeof v === 'object') ? v : { pins: [] };
+		}
+		function savePrefs(p) { if (win.PS.prefs && win.PS.prefs.set) win.PS.prefs.set(PREFS_KEY, p); }
+		function getPinned() { return getPrefs().pins || []; }
+		function isPinned(name) { return getPinned().indexOf(name) !== -1; }
+		function togglePin(name) {
+			var p = getPrefs(); p.pins = p.pins || [];
+			var idx = p.pins.indexOf(name);
+			if (idx === -1) p.pins.push(name); else p.pins.splice(idx, 1);
+			savePrefs(p);
+		}
+
+		function getAllTeams() { return (win.PS.teams && win.PS.teams.list) || []; }
+		function saveTeams() { if (win.PS.teams && win.PS.teams.save) win.PS.teams.save(); }
+
+		function getAllFolderPaths() {
+			var seen = {}, all = [];
+			getAllTeams().forEach(function (t) {
+				if (!t || !t.folder) return;
+				var parts = t.folder.split('/');
+				for (var j = 1; j <= parts.length; j++) {
+					var path = parts.slice(0, j).join('/');
+					if (!seen[path]) { seen[path] = true; all.push(path); }
+				}
+			});
+			return all.sort();
+		}
+		function folderDisplayName(path) { var parts = path.split('/'); return parts[parts.length - 1]; }
+		function folderDepth(path) { return path.split('/').length - 1; }
+		function getChildFolders(parentPath) {
+			var all = getAllFolderPaths();
+			return all.filter(function (p) {
+				if (parentPath === '') return p.indexOf('/') === -1;
+				if (!p.startsWith(parentPath + '/')) return false;
+				return p.slice(parentPath.length + 1).indexOf('/') === -1;
+			});
+		}
+		function esc(s) {
+			return win.BattleLog ? win.BattleLog.escapeHTML(s)
+				: String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+		}
+
+		function getOverviewRoom() { return win.PS.rooms['teambuilder']; }
+		function getCurrentTeamRoom() {
+			var room = win.PS.room;
+			return (room && room.id && room.id.indexOf('team-') === 0) ? room : null;
+		}
+		function refreshOverview() {
+			var room = getOverviewRoom();
+			if (room && typeof room.update === 'function') room.update(null);
+		}
+
+		function moveToFolder(team, folderName) {
+			var teamName = team.name;
+			var prevFolder = team.folder;
+			team.folder = folderName;
+			saveTeams();
+			var home = win.PS.rooms[''];
+			var userid = win.PS.user && win.PS.user.userid;
+			if (home && userid && typeof home.send === 'function') {
+				var msg = folderName
+					? 'Moved “' + teamName + '” to folder: ' + folderName
+					: 'Removed “' + teamName + '” from folder: ' + prevFolder;
+				home.send('/pm ' + userid + ', ' + msg);
+				// Old client's own version of this (above) follows the
+				// self-PM with an explicit notifyOnce() call, and that's
+				// not redundant decoration - it's load-bearing. A
+				// message's own highlight/notify path (handleHighlight in
+				// panel-chat.tsx) explicitly bails out whenever the
+				// sender is yourself ('if (userid === PS.user.userid)
+				// return false;', confirmed directly in the new client's
+				// own source), so a self-PM never lights up anything on
+				// its own, on either client - sending it was never going
+				// to be enough by itself. This new-client port only ever
+				// sent the PM and never added the matching notify() call,
+				// so nothing ever told the Home tab to highlight.
+				// room.notify() (PSRoom.prototype.notify, client-main.ts)
+				// already skips notifying when you're currently looking
+				// right at this room - the same "don't bother, you'd see
+				// it directly" behavior old client's notifyOnce's
+				// once=true gives - so no extra focus-checking is needed
+				// here to match it.
+				if (typeof home.notify === 'function') {
+					home.notify({ title: 'Folder update', body: msg, id: 'folder-move' });
+				}
+			}
+			refreshOverview();
+			var teamRoom = getCurrentTeamRoom();
+			if (teamRoom && typeof teamRoom.update === 'function') teamRoom.update(null);
+		}
+
+		// ─── sidebar (.folderpane .folderlist) ───
+		function getVisibleFolderpane() {
+			var candidates = document.querySelectorAll('#room-teambuilder .folderpane');
+			for (var i = 0; i < candidates.length; i++) {
+				if (candidates[i].offsetParent !== null) return candidates[i];
+			}
+			return null;
+		}
+
+		function getSubRowsFor(folderlist, parentName) {
+			var subs = [];
+			folderlist.querySelectorAll('.ps-subfolder-row').forEach(function (el) {
+				var sub = el.dataset && el.dataset.psSubfolder || '';
+				if (sub.startsWith(parentName + '/')) subs.push(el);
+			});
+			return subs;
+		}
+
+		// Builds a synthetic sidebar row for one subfolder path, matching
+		// the real .folder/.selectFolder markup panel-teambuilder.tsx
+		// itself renders (button, not div, for the clickable part) so
+		// Showdown's own delegated click handling on .folderlist (which
+		// checks elem.className === 'selectFolder' via normal DOM event
+		// bubbling) picks it up exactly like a native row.
+		function makeFolderRow(dataVal, label, isCur, indent) {
+			var row = document.createElement('div');
+			row.className = 'folder ps-subfolder-row' + (isCur ? ' cur' : '');
+			var icon = isCur ? 'fa-folder-open' : 'fa-folder-o';
+			var indentHtml = indent ? '<span class="ps-sub-indent">└</span>' : '';
+			var innerHtml = '<button class="selectFolder" data-value="' + esc(dataVal) + '">' +
+				indentHtml + '<i class="fa ' + icon + '"></i> ' + esc(label) + '</button>';
+			if (isCur) {
+				row.innerHTML = '<div class="folderhack3"><div class="folderhack1"></div><div class="folderhack2"></div>' + innerHtml + '</div>';
+			} else {
+				row.innerHTML = innerHtml;
+			}
+			return row;
+		}
+
+		function injectSubfolderRowsNew(folderlist) {
+			folderlist.querySelectorAll('.ps-subfolder-row').forEach(function (el) { el.parentNode.removeChild(el); });
+
+			var allPaths = getAllFolderPaths();
+			var subPaths = allPaths.filter(function (p) { return p.indexOf('/') !== -1; });
+			if (!subPaths.length) return;
+
+			var room = getOverviewRoom();
+			var curFolder = (room && room.curFolder) || '';
+
+			if (!document.getElementById('ps-subfolder-style')) {
+				var style = document.createElement('style');
+				style.id = 'ps-subfolder-style';
+				style.textContent = [
+					'.ps-subfolder-row > .selectFolder { padding-left: 20px !important; }',
+					'.ps-subfolder-row > .selectFolder .ps-sub-indent { color: #aaa; margin-right: 3px; font-size: 9px; }',
+					'.ps-pin-header .selectFolder { font-weight:bold; color:#557 !important; cursor:default !important; background:#c7d3dc !important; pointer-events:none !important; }',
+				].join('\n');
+				document.head.appendChild(style);
+			}
+
+			subPaths.forEach(function (subPath) {
+				var parts = subPath.split('/');
+				var parentPath = parts.slice(0, -1).join('/');
+				var parentDataVal = parentPath + '/';
+				var parentBtn = null;
+				folderlist.querySelectorAll('.selectFolder').forEach(function (btn) {
+					if (btn.getAttribute('data-value') === parentDataVal) parentBtn = btn;
+				});
+				if (!parentBtn) return;
+				var parentRow = parentBtn.closest('.folder');
+				if (!parentRow) return;
+
+				var isCur = curFolder === (subPath + '/');
+				var subRow = makeFolderRow(subPath + '/', folderDisplayName(subPath), isCur, true);
+				subRow.dataset.psSubfolder = subPath;
+
+				var insertAfterEl = parentRow;
+				var next = parentRow.nextSibling;
+				while (next && next.classList && next.classList.contains('ps-subfolder-row')) {
+					var nextSub = (next.dataset && next.dataset.psSubfolder) || '';
+					if (!nextSub.startsWith(parentPath + '/')) break;
+					insertAfterEl = next;
+					next = next.nextSibling;
+				}
+				if (insertAfterEl.nextSibling) folderlist.insertBefore(subRow, insertAfterEl.nextSibling);
+				else folderlist.appendChild(subRow);
+			});
+		}
+
+		function enhanceSidebarNew() {
+			var folderpane = getVisibleFolderpane();
+			if (!folderpane) return;
+			var folderlist = folderpane.querySelector('.folderlist');
+			if (!folderlist) return;
+
+			injectSubfolderRowsNew(folderlist);
+
+			var namedRows = [];
+			folderlist.querySelectorAll('.selectFolder').forEach(function (btn) {
+				if (btn.closest('.ps-subfolder-row')) return;
+				var val = btn.getAttribute('data-value');
+				if (val && val !== '/' && val.slice(-1) === '/') {
+					namedRows.push({ row: btn.closest('.folder'), name: val.slice(0, -1) });
+				}
+			});
+
+			var pins = getPinned().filter(function (p) {
+				return namedRows.some(function (r) { return r.name === p; }) || getAllFolderPaths().indexOf(p) !== -1;
+			});
+
+			folderlist.querySelectorAll('.ps-pin-header').forEach(function (el) { el.parentNode.removeChild(el); });
+			if (!pins.length) return;
+
+			// "All teams" is data-value="" in the new client (was "all" in
+			// the old one) - the very first folder row.
+			var allRow = null;
+			folderlist.querySelectorAll('.selectFolder').forEach(function (btn) {
+				if (btn.getAttribute('data-value') === '') allRow = btn.closest('.folder');
+			});
+
+			function insertAfter(newNode, ref) {
+				if (ref && ref.nextSibling) folderlist.insertBefore(newNode, ref.nextSibling);
+				else folderlist.appendChild(newNode);
+			}
+
+			var pinHeader = document.createElement('div');
+			pinHeader.className = 'folder ps-pin-header';
+			pinHeader.innerHTML = '<div class="selectFolder"><i class="fa fa-thumb-tack" style="color:#e8a000"></i> Pinned</div>';
+
+			var anchor = allRow;
+			insertAfter(pinHeader, anchor);
+			anchor = pinHeader;
+
+			pins.forEach(function (name) {
+				var row = namedRows.find(function (r) { return r.name === name; });
+				var rowDiv = row ? row.row : makeFolderRow(name + '/', folderDisplayName(name), false, false);
+				insertAfter(rowDiv, anchor);
+				anchor = rowDiv;
+				getSubRowsFor(folderlist, name).forEach(function (subRow) {
+					insertAfter(subRow, anchor);
+					anchor = subRow;
+				});
+			});
+		}
+
+		// ─── team list (.teampane ul.teamlist) ───
+		function getVisibleTeampane() {
+			var candidates = document.querySelectorAll('#room-teambuilder .teampane');
+			for (var i = 0; i < candidates.length; i++) {
+				if (candidates[i].offsetParent !== null) return candidates[i];
+			}
+			return null;
+		}
+
+		function enhanceTeamListNew() {
+			var teampane = getVisibleTeampane();
+			if (!teampane) return;
+			var teamlist = teampane.querySelector('ul.teamlist');
+			if (!teamlist) return;
+
+			teamlist.querySelectorAll('.ps-folder-group-header, .ps-nofolder-header').forEach(function (h) { h.parentNode.removeChild(h); });
+
+			var room = getOverviewRoom();
+			var curFolder = (room && room.curFolder) || '';
+			// Only regroup the flat "all teams" view (curFolder === '')
+			// with folder-divider headers - a single open folder/format
+			// is already exactly what Showdown itself chose to show.
+			if (curFolder !== '') return;
+
+			function navigateTo(folderValue) {
+				var r = getOverviewRoom();
+				if (!r) return;
+				r.curFolder = folderValue;
+				if (typeof r.resetExport === 'function') r.resetExport();
+				if (typeof r.update === 'function') r.update(null);
+			}
+
+			var items = [];
+			teamlist.querySelectorAll('li[data-teamkey]').forEach(function (li) {
+				var key = li.getAttribute('data-teamkey');
+				var team = win.PS.teams.byKey[key];
+				if (!team) return;
+				items.push({ li: li, teamFolder: team.folder || '' });
+			});
+
+			var unfoldered = items.filter(function (it) { return !it.teamFolder; });
+			var foldered = items.filter(function (it) { return it.teamFolder; });
+			if (!foldered.length) return; // nothing to group - leave Showdown's own order alone
+
+			var byFolder = {}, folderOrder = [];
+			foldered.forEach(function (it) {
+				if (!byFolder[it.teamFolder]) { byFolder[it.teamFolder] = []; folderOrder.push(it.teamFolder); }
+				byFolder[it.teamFolder].push(it);
+			});
+
+			var allPaths = getAllFolderPaths();
+			var pins = getPinned().filter(function (p) { return byFolder[p] || allPaths.indexOf(p) !== -1; });
+
+			// A pin can be an implicit parent (no teams directly in it,
+			// e.g. everything lives one level deeper in a subfolder) -
+			// its genuine child folders (which do have teams) get
+			// grouped directly underneath it here, rather than left to
+			// appear separately, later, among the alphabetically-sorted
+			// "others".
+			var pinnedChildren = {};
+			pins.forEach(function (p) {
+				pinnedChildren[p] = folderOrder.filter(function (f) { return f !== p && f.indexOf(p + '/') === 0; });
+			});
+			var allPinnedChildNames = [].concat.apply([], pins.map(function (p) { return pinnedChildren[p]; }));
+
+			var others = folderOrder.filter(function (f) { return pins.indexOf(f) === -1 && allPinnedChildNames.indexOf(f) === -1; }).sort();
+			var orderedFolders = [];
+			pins.forEach(function (p) {
+				orderedFolders.push(p);
+				orderedFolders = orderedFolders.concat(pinnedChildren[p]);
+			});
+			orderedFolders = orderedFolders.concat(others);
+
+			var frag = document.createDocumentFragment();
+			orderedFolders.forEach(function (folderName) {
+				var depth = folderDepth(folderName);
+				var header = document.createElement('li');
+				header.className = 'ps-folder-group-header';
+				header.style.cssText = 'list-style:none;padding:4px 8px 2px ' + (8 + depth * 12) + 'px;color:#9ab;font-size:9pt;border-top:1px solid rgba(255,255,255,.08);margin-top:4px;cursor:pointer;';
+				header.innerHTML = '<i class="fa fa-folder-o" style="margin-right:4px;"></i>' + esc(folderDisplayName(folderName));
+				if (depth > 0) {
+					header.innerHTML = '<span style="color:#aaa;font-size:9px;">└ </span>' + header.innerHTML;
+				}
+				if (isPinned(folderName)) {
+					header.innerHTML += ' <i class="fa fa-thumb-tack" style="color:#e8a000;font-size:8px;margin-left:4px;" title="Pinned"></i>';
+				}
+				header.title = 'Open folder ' + folderName;
+				header.addEventListener('click', function () { navigateTo(folderName + '/'); });
+				frag.appendChild(header);
+				(byFolder[folderName] || []).forEach(function (it) { frag.appendChild(it.li); });
+			});
+			if (unfoldered.length && orderedFolders.length) {
+				var noFolderLabel = document.createElement('li');
+				noFolderLabel.className = 'ps-nofolder-header';
+				noFolderLabel.style.cssText = 'list-style:none;padding:4px 8px 2px 8px;color:#9ab;font-size:9pt;border-top:1px solid rgba(255,255,255,.08);margin-top:4px;cursor:pointer;';
+				noFolderLabel.innerHTML = '<i class="fa fa-minus" style="margin-right:4px;"></i>No Folder';
+				noFolderLabel.title = 'Show only teams with no folder';
+				noFolderLabel.addEventListener('click', function () { navigateTo('/'); });
+				frag.appendChild(noFolderLabel);
+			}
+			unfoldered.forEach(function (it) { frag.appendChild(it.li); });
+			teamlist.appendChild(frag);
+		}
+
+		// ─── pin button next to Rename/Remove in an open folder's <h2> ───
+		function injectFolderHeaderPinNew() {
+			var teampane = getVisibleTeampane();
+			if (!teampane) return;
+			var h2 = teampane.querySelector('h2');
+			if (!h2) return;
+			// Rename+Remove only render together for a genuine named
+			// folder (not the all-teams/uncategorized/format-folder
+			// headers) - the fa-times icon is unique to Remove there.
+			var removeIcon = h2.querySelector('.fa-times');
+			var removeBtn = removeIcon && removeIcon.closest('button');
+			if (!removeBtn) {
+				var existing = h2.querySelector('.ps-header-pin');
+				if (existing) existing.parentNode.removeChild(existing);
+				return;
+			}
+			if (h2.querySelector('.ps-header-pin')) return;
+
+			var room = getOverviewRoom();
+			var folderName = (room && room.curFolder && room.curFolder.slice(-1) === '/') ? room.curFolder.slice(0, -1) : null;
+			if (!folderName) return;
+
+			var pinned = isPinned(folderName);
+			var btn = document.createElement('button');
+			btn.className = 'button small ps-header-pin';
+			btn.style.marginLeft = '5px';
+			btn.title = pinned ? 'Unpin folder from sidebar' : 'Pin folder to top of sidebar';
+			btn.innerHTML = '<i class="fa fa-thumb-tack"></i> ' + (pinned ? 'Unpin' : 'Pin');
+			if (pinned) btn.style.color = '#e8a000';
+			btn.addEventListener('click', function (e) {
+				e.stopPropagation(); e.preventDefault();
+				togglePin(folderName);
+				refreshOverview();
+			});
+			removeBtn.insertAdjacentElement('afterend', btn);
+		}
+
+		// ─── child-folder quick-nav shown inside a subfolder's own team list ───
+		function injectSubfolderNavNew() {
+			var teampane = getVisibleTeampane();
+			if (!teampane) return;
+
+			var existing = teampane.querySelector('.ps-subfolder-nav');
+			if (existing) existing.parentNode.removeChild(existing);
+
+			var room = getOverviewRoom();
+			var curFolder = (room && room.curFolder) || '';
+			if (curFolder.slice(-1) !== '/') return;
+			var parentFolder = curFolder.slice(0, -1);
+			if (!parentFolder) return;
+
+			var children = getChildFolders(parentFolder);
+			if (!children.length) return;
+
+			var nav = document.createElement('p');
+			nav.className = 'ps-subfolder-nav';
+			nav.style.cssText = 'margin:4px 12px 8px;';
+
+			children.forEach(function (childPath) {
+				var btn = document.createElement('button');
+				btn.className = 'button';
+				btn.style.cssText = 'margin:2px 4px 2px 0;font-size:9pt;';
+				btn.innerHTML = '<i class="fa fa-folder-o"></i> ' + esc(folderDisplayName(childPath));
+				btn.addEventListener('click', function (e) {
+					e.stopPropagation();
+					var r = getOverviewRoom();
+					if (!r) return;
+					r.curFolder = childPath + '/';
+					if (typeof r.resetExport === 'function') r.resetExport();
+					if (typeof r.update === 'function') r.update(null);
+				});
+				nav.appendChild(btn);
+			});
+
+			var h2 = teampane.querySelector('h2');
+			if (h2) {
+				h2.insertAdjacentElement('afterend', nav);
+			} else {
+				teampane.insertBefore(nav, teampane.firstChild);
+			}
+		}
+
+		// ─── ancestor breadcrumb in a nested subfolder's own <h2> ───
+		// Showdown's native header just prints the whole path as flat text
+		// ("VGC/2026") - this makes each ancestor segment clickable. Rather
+		// than overwriting the native, Preact-owned title span's innerHTML
+		// (risky: Preact keeps its own references to those exact child
+		// nodes and a future re-render could misbehave if they're replaced
+		// out from under it - see the caution already given to sidebar/
+		// team-list work above), this only ever hides that native span via
+		// a plain style property Preact itself never sets, and adds a
+		// brand new sibling span next to it - the same "add a sibling,
+		// don't rewrite Preact's own children" approach used everywhere
+		// else in this file.
+		function injectFolderBreadcrumbNew() {
+			var teampane = getVisibleTeampane();
+			if (!teampane) return;
+			var h2 = teampane.querySelector('h2');
+			if (!h2) return;
+			var titleSpan = h2.querySelector('.teambuilder-folder-title');
+
+			var existingBar = h2.querySelector('.ps-breadcrumb-bar');
+			if (existingBar) existingBar.parentNode.removeChild(existingBar);
+
+			var room = getOverviewRoom();
+			var curFolder = (room && room.curFolder) || '';
+			var folderPath = (curFolder.slice(-1) === '/') ? curFolder.slice(0, -1) : '';
+			var isNestedSubfolder = !!folderPath && folderPath.indexOf('/') !== -1;
+
+			if (titleSpan) titleSpan.style.display = isNestedSubfolder ? 'none' : '';
+			if (!isNestedSubfolder || !titleSpan) return;
+
+			if (!document.getElementById('ps-breadcrumb-style')) {
+				var style = document.createElement('style');
+				style.id = 'ps-breadcrumb-style';
+				style.textContent = '.ps-breadcrumb{color:#6af;text-decoration:none;}\n.ps-bc-sep{color:#aaa;}';
+				document.head.appendChild(style);
+			}
+
+			var countEl = titleSpan.querySelector('small');
+			var countHtml = countEl ? countEl.outerHTML : '';
+			var parts = folderPath.split('/');
+			var label = folderDisplayName(folderPath);
+			var breadcrumbLinks = parts.slice(0, -1).map(function (p, idx) {
+				var ancestorPath = parts.slice(0, idx + 1).join('/');
+				return '<a href="#" class="ps-breadcrumb" data-folder="' + esc(ancestorPath + '/') + '">' + esc(p) + '</a>';
+			}).join(' <span class="ps-bc-sep">›</span> ');
+
+			var bar = document.createElement('span');
+			bar.className = 'teambuilder-folder-title ps-breadcrumb-bar';
+			bar.innerHTML = '<i class="fa fa-folder-open" aria-hidden></i> ' + breadcrumbLinks +
+				' <span class="ps-bc-sep">›</span> <strong>' + esc(label) + '</strong> ' + countHtml;
+			titleSpan.insertAdjacentElement('afterend', bar);
+
+			bar.querySelectorAll('.ps-breadcrumb').forEach(function (a) {
+				a.addEventListener('click', function (e) {
+					e.preventDefault(); e.stopPropagation();
+					var r = getOverviewRoom();
+					if (!r) return;
+					r.curFolder = a.getAttribute('data-folder');
+					if (typeof r.resetExport === 'function') r.resetExport();
+					if (typeof r.update === 'function') r.update(null);
+				});
+			});
+		}
+
+		// ─── per-team "Folder" quick-move dropdown + LabMaus Team button ───
+		function closeDropdown() {
+			var el = document.getElementById('ps-folder-picker');
+			if (el) el.parentNode.removeChild(el);
+		}
+		document.addEventListener('click', function (e) {
+			var el = document.getElementById('ps-folder-picker');
+			if (el && !el.contains(e.target)) closeDropdown();
+		});
+
+		function positionPopup(popup, anchorEl) {
+			var rect = anchorEl.getBoundingClientRect();
+			popup.style.top = (rect.bottom + 4) + 'px';
+			popup.style.left = rect.left + 'px';
+			requestAnimationFrame(function () {
+				var r = popup.getBoundingClientRect();
+				if (r.right > window.innerWidth - 8) popup.style.left = Math.max(8, rect.right - popup.offsetWidth) + 'px';
+			});
+		}
+
+		function showFolderReorganizerNew(folderPath, anchorEl) {
+			closeDropdown();
+			var folderName = folderDisplayName(folderPath);
+			var allPaths = getAllFolderPaths();
+
+			var popup = document.createElement('div');
+			popup.id = 'ps-folder-picker';
+			popup.className = 'ps-popup';
+			popup.style.cssText = 'position:fixed;z-index:99999;padding:5px 8px;min-width:240px;max-height:60vh;overflow-y:auto;';
+
+			var ul = document.createElement('ul');
+			ul.className = 'popupmenu';
+
+			var titleLi = document.createElement('li');
+			var h3 = document.createElement('h3');
+			h3.textContent = 'Move folder “' + folderName + '” into…';
+			titleLi.appendChild(h3);
+			ul.appendChild(titleLi);
+
+			function applyMove(newPath) {
+				if (newPath === folderPath) return;
+				getAllTeams().forEach(function (t) {
+					if (!t) return;
+					if (t.folder === folderPath) {
+						t.folder = newPath;
+					} else if (t.folder && t.folder.startsWith(folderPath + '/')) {
+						t.folder = newPath + t.folder.slice(folderPath.length);
+					}
+				});
+				saveTeams();
+				refreshOverview();
+				var teamRoom = getCurrentTeamRoom();
+				if (teamRoom && typeof teamRoom.update === 'function') teamRoom.update(null);
+			}
+
+			function addOption(label, icon, newPath, disabled) {
+				var li = document.createElement('li');
+				var btn = document.createElement('button');
+				btn.className = 'button';
+				btn.style.cssText = 'display:block;width:100%;text-align:left;margin:1px 0;font-size:9pt;' + (disabled ? 'opacity:0.4;' : '');
+				btn.innerHTML = '<i class="fa ' + icon + '"></i> ' + esc(label);
+				if (disabled) {
+					btn.disabled = true;
+				} else {
+					btn.addEventListener('click', function (e) {
+						e.stopPropagation();
+						closeDropdown();
+						applyMove(newPath);
+					});
+				}
+				li.appendChild(btn);
+				ul.appendChild(li);
+			}
+
+			var isAlreadyTopLevel = folderPath.indexOf('/') === -1;
+			addOption('(Top level) — make “' + folderName + '” a main folder', 'fa-home',
+				folderName, isAlreadyTopLevel);
+
+			var sep = document.createElement('li');
+			sep.style.cssText = 'border-top:1px solid #bbb;margin:3px -8px;';
+			ul.appendChild(sep);
+
+			var validParents = allPaths.filter(function (p) {
+				if (p === folderPath) return false;
+				if (p.startsWith(folderPath + '/')) return false;
+				return true;
+			});
+
+			if (validParents.length) {
+				validParents.forEach(function (parentPath) {
+					var depth = folderDepth(parentPath);
+					var indent = ' '.repeat(depth * 2);
+					var wouldBe = parentPath + '/' + folderName;
+					var alreadyThere = folderPath === wouldBe;
+					addOption(indent + folderDisplayName(parentPath) + ' › ' + folderName,
+						depth > 0 ? 'fa-folder-o' : 'fa-folder',
+						wouldBe, alreadyThere);
+				});
+			} else {
+				var noLi = document.createElement('li');
+				noLi.style.cssText = 'color:#888;font-size:8pt;padding:2px 4px;';
+				noLi.textContent = 'No other folders to move into.';
+				ul.appendChild(noLi);
+			}
+
+			popup.appendChild(ul);
+			document.body.appendChild(popup);
+			positionPopup(popup, anchorEl);
+		}
+
+		function showFolderPickerNew(anchorEl, team) {
+			closeDropdown();
+			var allPaths = getAllFolderPaths();
+			var pins = getPinned();
+			var pinnedFolders = pins.filter(function (p) { return allPaths.indexOf(p) !== -1; });
+
+			var popup = document.createElement('div');
+			popup.id = 'ps-folder-picker';
+			popup.className = 'ps-popup';
+			popup.style.cssText = 'position:fixed;z-index:99999;padding:5px 8px;min-width:240px;max-height:60vh;overflow-y:auto;';
+
+			var ul = document.createElement('ul');
+			ul.className = 'popupmenu';
+
+			function addHeader(text) {
+				var li = document.createElement('li'); var h3 = document.createElement('h3');
+				h3.textContent = text; li.appendChild(h3); ul.appendChild(li);
+			}
+			function addSep() {
+				var li = document.createElement('li');
+				li.style.cssText = 'border-top:1px solid #bbb;margin:3px -8px;';
+				ul.appendChild(li);
+			}
+			function addFolderItem(folderPath) {
+				var isCurrent = team.folder === folderPath;
+				var pinned = isPinned(folderPath);
+				var depth = folderDepth(folderPath);
+				var label = folderDisplayName(folderPath);
+
+				var li = document.createElement('li');
+				li.style.cssText = 'display:flex;align-items:center;gap:2px;';
+
+				var moveBtn = document.createElement('button');
+				moveBtn.className = 'option';
+				moveBtn.style.cssText = 'flex:1;text-align:left;padding-left:' + (6 + depth * 14) + 'px;' + (isCurrent ? 'opacity:0.5;cursor:default;' : '');
+				var treePfx = depth > 0 ? '<span style="color:#aaa;margin-right:2px;font-size:9px;">└</span>' : '';
+				var ico = isCurrent ? 'fa-folder-open-o' : 'fa-folder-o';
+				moveBtn.innerHTML = treePfx + '<i class="fa ' + ico + '"></i> ' + esc(label) + (isCurrent ? ' <small>(current)</small>' : '');
+				if (!isCurrent) moveBtn.addEventListener('click', function () { closeDropdown(); moveToFolder(team, folderPath); });
+				else moveBtn.disabled = true;
+
+				var subBtn = document.createElement('button');
+				subBtn.className = 'button'; subBtn.title = 'New subfolder inside “' + folderPath + '”';
+				subBtn.style.cssText = 'padding:2px 6px;font-size:9pt;';
+				subBtn.innerHTML = '<i class="fa fa-folder-o"></i><sup style="font-size:7px;vertical-align:top;">+</sup>';
+				subBtn.addEventListener('click', function (e) {
+					e.stopPropagation(); closeDropdown();
+					win.PS.prompt('New subfolder inside “' + folderPath + '”:', { okButton: 'Create & move here', parentElem: anchorEl }).then(function (name) {
+						if (!name) return;
+						name = name.replace(/\//g, '').trim();
+						if (!name) return;
+						moveToFolder(team, folderPath + '/' + name);
+					});
+				});
+
+				var renameBtn = document.createElement('button');
+				renameBtn.className = 'button';
+				renameBtn.title = 'Move folder “' + folderPath + '” to top-level or inside another folder';
+				renameBtn.style.cssText = 'padding:2px 6px;font-size:9pt;';
+				renameBtn.innerHTML = '<i class="fa fa-sitemap"></i>';
+				renameBtn.addEventListener('click', function (e) {
+					e.stopPropagation();
+					closeDropdown();
+					showFolderReorganizerNew(folderPath, anchorEl);
+				});
+
+				var openBtn = document.createElement('button');
+				openBtn.className = 'button';
+				openBtn.title = 'Open folder';
+				openBtn.style.cssText = 'padding:2px 6px;font-size:9pt;';
+				openBtn.innerHTML = '<i class="fa fa-arrow-right"></i>';
+				openBtn.addEventListener('click', function (e) {
+					e.stopPropagation();
+					closeDropdown();
+					var overviewRoom = getOverviewRoom();
+					if (!overviewRoom) return;
+					overviewRoom.curFolder = folderPath + '/';
+					if (typeof overviewRoom.resetExport === 'function') overviewRoom.resetExport();
+					if (win.PS.join) win.PS.join('teambuilder');
+					if (typeof overviewRoom.update === 'function') overviewRoom.update(null);
+				});
+
+				var pinBtn = document.createElement('button');
+				pinBtn.className = 'button'; pinBtn.title = pinned ? 'Unpin from top' : 'Pin to top';
+				pinBtn.style.cssText = 'padding:2px 6px;font-size:9pt;color:' + (pinned ? '#e8a000' : '');
+				pinBtn.innerHTML = '<i class="fa fa-thumb-tack"></i>';
+				pinBtn.addEventListener('click', function (e) {
+					e.stopPropagation(); togglePin(folderPath); refreshOverview();
+					closeDropdown(); showFolderPickerNew(anchorEl, team);
+				});
+
+				li.appendChild(moveBtn); li.appendChild(subBtn); li.appendChild(renameBtn); li.appendChild(openBtn); li.appendChild(pinBtn);
+				ul.appendChild(li);
+			}
+
+			if (pinnedFolders.length) { addHeader('Pinned'); pinnedFolders.forEach(addFolderItem); if (allPaths.length) addSep(); }
+			if (allPaths.length) {
+				if (pinnedFolders.length) addHeader('All Folders');
+				allPaths.forEach(addFolderItem);
+			} else {
+				var emptyLi = document.createElement('li');
+				emptyLi.style.cssText = 'color:#888;padding:2px 4px;font-size:8pt;';
+				emptyLi.textContent = 'No named folders yet.';
+				ul.appendChild(emptyLi);
+			}
+
+			addSep();
+			if (team.folder) {
+				var curParts = team.folder.split('/');
+				if (curParts.length > 1) {
+					var parentPath = curParts.slice(0, -1).join('/');
+					var moveUpLi = document.createElement('li'); var moveUpBtn = document.createElement('button');
+					moveUpBtn.className = 'option';
+					moveUpBtn.innerHTML = '<i class="fa fa-arrow-up"></i> Move up to “' + esc(parentPath) + '”';
+					moveUpBtn.addEventListener('click', function () { closeDropdown(); moveToFolder(team, parentPath); });
+					moveUpLi.appendChild(moveUpBtn); ul.appendChild(moveUpLi);
+				}
+				var removeLi = document.createElement('li'); var removeBtn = document.createElement('button');
+				removeBtn.className = 'option';
+				removeBtn.innerHTML = '<i class="fa fa-times"></i> Remove from folder';
+				removeBtn.addEventListener('click', function () { closeDropdown(); moveToFolder(team, ''); });
+				removeLi.appendChild(removeBtn); ul.appendChild(removeLi);
+			}
+
+			var newLi = document.createElement('li'); var newBtn = document.createElement('button');
+			newBtn.className = 'option';
+			newBtn.innerHTML = '<i class="fa fa-plus"></i> New folder…';
+			newBtn.addEventListener('click', function () {
+				closeDropdown();
+				win.PS.prompt('Folder name (use / for subfolders, e.g. VGC/2026):', { okButton: 'Move to folder', parentElem: anchorEl }).then(function (name) {
+					if (!name) return;
+					name = name.replace(/^\/+|\/+$/, '').replace(/\/+/g, '/').trim();
+					if (!name) return;
+					moveToFolder(team, name);
+				});
+			});
+			newLi.appendChild(newBtn); ul.appendChild(newLi);
+
+			popup.appendChild(ul);
+			document.body.appendChild(popup);
+			positionPopup(popup, anchorEl);
+		}
+
+		function injectButtonNew() {
+			var teamRoom = getCurrentTeamRoom();
+			if (!teamRoom) return;
+			var el = document.getElementById('room-' + teamRoom.id);
+			if (!el) return;
+			var backLink = el.querySelector('.team-pad a.button[href="teambuilder"]');
+			if (!backLink) return;
+			if (document.getElementById('ps-move-folder-btn')) return;
+
+			var team = (typeof teamRoom.getTeam === 'function') ? teamRoom.getTeam() : teamRoom.team;
+			if (!team) return;
+
+			var btn = document.createElement('button');
+			btn.id = 'ps-move-folder-btn';
+			btn.className = 'button';
+			btn.title = 'Move to folder';
+			btn.innerHTML = '<i class="fa fa-folder"></i> Folder';
+			btn.addEventListener('click', function (e) {
+				e.stopPropagation();
+				var t = (typeof teamRoom.getTeam === 'function') ? teamRoom.getTeam() : teamRoom.team;
+				if (!t) return;
+				showFolderPickerNew(btn, t);
+			});
+			backLink.insertAdjacentElement('afterend', btn);
+
+			if (document.getElementById('qol2-labmaus-team-btn')) return;
+			var labmausTeamBtn = document.createElement('button');
+			labmausTeamBtn.id = 'qol2-labmaus-team-btn';
+			labmausTeamBtn.className = 'button';
+			labmausTeamBtn.title = 'Find similar teams on LabMaus';
+			var labmausTeamIcon = document.createElement('img');
+			labmausTeamIcon.src = 'https://favicon.im/labmaus.net';
+			labmausTeamIcon.style.cssText = 'width:14px;height:14px;vertical-align:middle;image-rendering:auto;margin-right:4px;';
+			labmausTeamIcon.onerror = function () { this.style.display = 'none'; };
+			labmausTeamBtn.appendChild(labmausTeamIcon);
+			labmausTeamBtn.appendChild(document.createTextNode('LabMaus Team'));
+			labmausTeamBtn.addEventListener('click', function (e) {
+				e.stopPropagation();
+				var t = (typeof teamRoom.getTeam === 'function') ? teamRoom.getTeam() : teamRoom.team;
+				var editor = teamRoom.editor;
+				if (!t || !editor || !editor.sets) return;
+				var pokemonFilter = editor.sets.filter(function (set) { return set && set.species; }).map(function (set) {
+					var speciesData = (win.Dex && win.Dex.species) ? win.Dex.species.get(set.species) : null;
+					var speciesName = (speciesData && speciesData.isMega && speciesData.baseSpecies) ? speciesData.baseSpecies : set.species;
+					if (String(set.species).toLowerCase().replace(/[^a-z]/g, '') === 'floetteeternal') speciesName = 'Floette';
+					var finalSpeciesData = (speciesName === set.species) ? speciesData : ((win.Dex && win.Dex.species) ? win.Dex.species.get(speciesName) : null);
+					if (finalSpeciesData && finalSpeciesData.gender) {
+						var baseId = speciesName.toLowerCase().replace(/[^a-z0-9]/g, '');
+						var counterpart = (win.Dex && win.Dex.species) ? win.Dex.species.get(baseId + 'f') : null;
+						if (counterpart && counterpart.exists && counterpart.id === baseId + 'f') {
+							speciesName += finalSpeciesData.gender === 'M' ? ' ♂' : ' ♀';
+						}
+					}
+					var entry = { pokemon: speciesName };
+					if (set.item) entry.item = set.item;
+					return entry;
+				});
+				var formatId = t.format || '';
+				var regMatch = /reg([a-z]+)$/i.exec(formatId);
+				var regulation = regMatch ? 'Regulation Set ' + regMatch[1].toUpperCase().split('').join('-') : '';
+				function toDateStr(d) { return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0'); }
+				var today = new Date(); var twoWeeksAgo = new Date(today); twoWeeksAgo.setDate(today.getDate() - 14);
+				var dateRange = toDateStr(twoWeeksAgo) + ' to ' + toDateStr(today);
+				var params = new URLSearchParams();
+				params.set('date_range', dateRange);
+				if (regulation) params.set('regulation', regulation);
+				params.set('pokemon_filter', JSON.stringify(pokemonFilter));
+				GM_openInTab('https://labmaus.net/teams/discover?' + params.toString(), { active: true, insert: true });
+			});
+			btn.insertAdjacentElement('afterend', labmausTeamBtn);
+		}
+
+		// ─── driving it all: re-run on every Preact re-render, guarded
+		// against reacting to our own DOM insertions (an earlier version
+		// of the old-client pin fix crashed the tab this way - see Move
+		// to Folder above - by observing a subtree before it finishes its
+		// own unconditional rebuild and catching its own mutation) ───
+		var applying = false;
+		function runOverviewEnhancements() {
+			if (applying) return;
+			applying = true;
+			try {
+				enhanceSidebarNew();
+				enhanceTeamListNew();
+				injectFolderHeaderPinNew();
+				injectSubfolderNavNew();
+				injectFolderBreadcrumbNew();
+			} catch (err) {
+				console.error('[Showdown Suite / Move to Folder, new client] enhancement pass failed:', err);
+			} finally {
+				setTimeout(function () { applying = false; }, 0);
+			}
+		}
+
+		var observedOverviewEl = null, overviewObserver = null;
+		var observedTeamEl = null, teamObserver = null;
+
+		function tick() {
+			if (!isNewClient()) return;
+
+			var overviewEl = document.getElementById('room-teambuilder');
+			if (overviewEl && overviewEl !== observedOverviewEl) {
+				if (overviewObserver) overviewObserver.disconnect();
+				observedOverviewEl = overviewEl;
+				overviewObserver = new MutationObserver(runOverviewEnhancements);
+				overviewObserver.observe(overviewEl, { childList: true, subtree: true });
+			}
+			if (overviewEl) runOverviewEnhancements();
+
+			var teamRoom = getCurrentTeamRoom();
+			if (teamRoom) {
+				var teamEl = document.getElementById('room-' + teamRoom.id);
+				if (teamEl && teamEl !== observedTeamEl) {
+					if (teamObserver) teamObserver.disconnect();
+					observedTeamEl = teamEl;
+					teamObserver = new MutationObserver(function () {
+						if (applying) return;
+						applying = true;
+						try { injectButtonNew(); } catch (err) { console.error('[Showdown Suite / Move to Folder, new client] injectButtonNew failed:', err); }
+						finally { setTimeout(function () { applying = false; }, 0); }
+					});
+					teamObserver.observe(teamEl, { childList: true, subtree: true });
+				}
+				if (teamEl) injectButtonNew();
+			}
+		}
+
+		setInterval(tick, 500);
+		tick();
 	})();
 
 	// ============================================================
@@ -2260,6 +3512,52 @@
 	(function () {
 		var STAT_NAMES = ['hp', 'atk', 'def', 'spa', 'spd', 'spe'];
 		var COMPARISON_OPS = ['>=', '<=', '==', '=', '>', '<'];
+
+		// TEMPORARY DIAGNOSTIC - safe to remove once the "chip takes a
+		// second to appear" report is resolved. The first version of this
+		// watched the WHOLE page (subtree:true from document.documentElement)
+		// for any added node merely CONTAINING a .dexlist-filters
+		// descendant - in a busy chat room (hundreds of users, constant
+		// join/leave churn), that's far too broad: some unrelated, larger
+		// panel getting rebuilt elsewhere on the page can easily contain
+		// the already-rendered chip as a left-over descendant, which that
+		// check couldn't tell apart from the chip actually being newly
+		// created. That's what produced a bogus ~22-SECOND reading
+		// (confirmed impossible - Preact's own render scheduling is a
+		// same-tick microtask, not requestAnimationFrame or
+		// requestIdleCallback, per the bundled preact.min.js) instead of
+		// measuring the real thing. Fixed by watching only the exact
+		// .dexlist element the chip actually gets written into (found
+		// fresh relative to the input box, not the whole document), for a
+		// direct child being added (no subtree needed - updateDOM() in
+		// battle-searchresults.tsx writes the filter <li> straight into
+		// the UL via innerHTML, not nested in a wrapper) - and the
+		// observer is created fresh per commit and torn down right after
+		// it fires (or after 5s if it never does), so it can't accumulate
+		// stale state across searches either.
+		function watchForChipAppearing(inputEl, commitStart) {
+			if (typeof MutationObserver === 'undefined') return;
+			var editorRoot = inputEl.closest ? inputEl.closest('.team-focus-editor') : null;
+			var list = (editorRoot || document).querySelector('.dexlist');
+			if (!list) {
+				return;
+			}
+			var obs = new MutationObserver(function (mutations) {
+				for (var i = 0; i < mutations.length; i++) {
+					var added = mutations[i].addedNodes;
+					for (var j = 0; j < added.length; j++) {
+						var node = added[j];
+						if (node.nodeType === 1 && node.classList && node.classList.contains('dexlist-filters')) {
+							var now = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+							obs.disconnect();
+							return;
+						}
+					}
+				}
+			});
+			obs.observe(list, { childList: true });
+			setTimeout(function () { obs.disconnect(); }, 5000);
+		}
 
 		// The real getQolPref/setQolPref live in the separate "Showdown
 		// Battle Update" section's own IIFE, which - unlike what was
@@ -2298,17 +3596,13 @@
 		function isLegalForCurrentFormat(liveSearch, speciesId) {
 			try {
 				var engine = liveSearch.engine || liveSearch.typedSearch;
-				console.log('[AdvSearch] isLegalForCurrentFormat: speciesId =', speciesId, '| liveSearch.engine =', liveSearch.engine, '| liveSearch.typedSearch =', liveSearch.typedSearch, '| resolved engine =', engine);
 				if (!engine || typeof engine.getTier !== 'function') {
-					console.log('[AdvSearch] isLegalForCurrentFormat: no usable engine.getTier found - failing open (treating as legal)');
 					return true;
 				}
 				var species = win.Dex.species.get(speciesId);
 				var tier = engine.getTier(species);
-				console.log('[AdvSearch] isLegalForCurrentFormat: species =', species && species.name, '| tier returned =', JSON.stringify(tier));
 				return ['Illegal', 'Unreleased'].indexOf(tier) === -1;
 			} catch (e) {
-				console.log('[AdvSearch] isLegalForCurrentFormat: threw, failing open (not filtering) -', e.message);
 				return true;
 			}
 		}
@@ -2414,6 +3708,26 @@
 		}
 
 		function canLearnMove(speciesId, moveId) {
+			// The chip/results still visibly lagged a beat after the
+			// data-cache prewarm because of a second, separate cost: for a
+			// term like "fire" that ISN'T a type or ability match,
+			// evaluateNode falls through to here for literally every
+			// non-matching species in the dex (900+ of them) - and
+			// getLearnsetChain() below walks that species' full evolution
+			// chain (with its own Dex.species.get() calls) the first time
+			// anything checks it against ANY word, cached per-species
+			// afterward but cold for virtually the whole dex on a
+			// session's first word-based query. Since "fire" was never a
+			// real move to begin with, every one of those chain-walks was
+			// wasted work. window.BattleMovedex (the same raw move table
+			// Showdown's own search reads - confirmed in
+			// battle-dex-search.ts) is a plain id lookup, so bailing out
+			// here when moveId isn't even a known move skips the
+			// expensive chain-walk entirely for type/ability terms (the
+			// overwhelming majority of queries), while a genuine move-name
+			// term (e.g. "fakeout") still falls through to the real check
+			// exactly as before.
+			if (!win.BattleMovedex || !(moveId in win.BattleMovedex)) return false;
 			var chain = getLearnsetChain(speciesId);
 			return chain.some(function (learnset) { return moveId in learnset; });
 		}
@@ -2498,6 +3812,36 @@
 			return cachedPokemonData;
 		}
 
+		// The multi-second pause before a committed search appears traces
+		// back to here, not to anything added for the display fix above:
+		// Dex.species.get() (battle-dex.ts) constructs a real Species
+		// object the FIRST time anything asks for a given id, memoizing it
+		// back into window.BattlePokedex itself so every later call for
+		// that same id is cheap - but getAllPokemonData() above is the
+		// first thing to ever ask for EVERY id in the entire dex (1000+
+		// entries, including every alternate forme) all at once, and
+		// without this, that one-time construction cost for the whole
+		// dex was happening synchronously inside the user's own Enter
+		// keypress on their very first advanced search of a session.
+		// Pre-warming it here, idly, as soon as Dex/BattlePokedex exist
+		// (long before the user has finished typing an actual query),
+		// means runSearch() almost always finds cachedPokemonData already
+		// populated and returns instantly, the same way it already does
+		// for every search after the first.
+		function prewarmPokemonDataCache() {
+			if (cachedPokemonData) return;
+			if (!win.Dex || !win.BattlePokedex) {
+				setTimeout(prewarmPokemonDataCache, 500);
+				return;
+			}
+			if (typeof requestIdleCallback === 'function') {
+				requestIdleCallback(function () { getCachedPokemonData(); }, { timeout: 5000 });
+			} else {
+				setTimeout(function () { getCachedPokemonData(); }, 1000);
+			}
+		}
+		prewarmPokemonDataCache();
+
 		// The team-editor context exposes a newer, Preact-based search
 		// object as win.editor.search; the standalone dex-browser table
 		// (the sortable one with tier headers and stat columns) exposes
@@ -2505,106 +3849,277 @@
 		// confirmed, deliberate debug exposures in Showdown's own client
 		// code - this handles whichever shape is actually present.
 		function getLiveSearch() {
-			console.log('[AdvSearch] getLiveSearch: win.editor =', win.editor, '| win.search =', win.search);
 			if (win.editor && win.editor.search) {
-				console.log('[AdvSearch] getLiveSearch: using win.editor.search (Preact-style)');
 				return win.editor.search;
 			}
 			if (win.search) {
-				console.log('[AdvSearch] getLiveSearch: using win.search directly (jQuery-style)');
 				return win.search;
 			}
-			console.log('[AdvSearch] getLiveSearch: FOUND NOTHING - neither win.editor.search nor win.search exist');
 			return null;
 		}
 
 		function applyResultsToLiveSearch(liveSearch, matchingRows, query) {
-			console.log('[AdvSearch] applyResultsToLiveSearch called with', matchingRows.length, 'rows, query =', JSON.stringify(query));
-			console.log('[AdvSearch] applyResultsToLiveSearch: liveSearch object =', liveSearch);
 			// Older, jQuery-based Search class: renders directly into a
 			// DOM element via resultSet + updateScroll(forceAdd), not a
 			// virtual-DOM re-render.
 			if (typeof liveSearch.updateScroll === 'function' && 'resultSet' in liveSearch) {
-				console.log('[AdvSearch] applyResultsToLiveSearch: taking jQuery-style branch (resultSet + updateScroll)');
 				liveSearch.resultSet = matchingRows;
 				liveSearch.q = query;
 				liveSearch.renderedIndex = 0;
 				liveSearch.renderingDone = false;
 				liveSearch.updateScroll(true);
-				console.log('[AdvSearch] applyResultsToLiveSearch: updateScroll(true) called, liveSearch.el.innerHTML is now:', liveSearch.el && liveSearch.el.innerHTML);
 				return;
 			}
 			// Newer, Preact-based DexSearch class.
 			if ('results' in liveSearch) {
-				console.log('[AdvSearch] applyResultsToLiveSearch: taking Preact-style branch (results + resultsComponent.forceUpdate)');
 				liveSearch.results = matchingRows;
 				if (liveSearch.resultsComponent && typeof liveSearch.resultsComponent.forceUpdate === 'function') {
 					liveSearch.resultsComponent.forceUpdate();
-					console.log('[AdvSearch] applyResultsToLiveSearch: resultsComponent.forceUpdate() called');
 				} else {
-					console.log('[AdvSearch] applyResultsToLiveSearch: WARNING - no resultsComponent.forceUpdate found, results set but nothing re-rendered');
 				}
 				return;
 			}
-			console.log('[AdvSearch] applyResultsToLiveSearch: WARNING - liveSearch matched NEITHER known shape, nothing applied');
+		}
+
+		// Showdown's own PSSearchResults component (battle-searchresults.tsx)
+		// does NOT treat an 'html' row as raw HTML - escapeHTML() runs on it
+		// first, and only <em>/<strong> get selectively un-escaped back to
+		// real tags afterward. The old client's jQuery-based results view has
+		// no such restriction (that's why the chipHtml string below, used
+		// for the old client only, has always rendered fine there) - but on
+		// the new client, any other tag (our <button>/<i> included) comes
+		// back out as literal, visible escaped text, which is exactly the
+		// broken "raw HTML" look that got reported. Separately, a flat
+		// alphabetical list was never how a *normal* committed search looks
+		// there either - native results group matched Pokemon under
+		// tier-header bars with a "Sort: Name/Types/..." row on top (see the
+		// reference "Psychic" search), none of which a flat ['pokemon', id]
+		// list produces.
+		//
+		// Both are fixed by using the exact same two mechanisms native
+		// search itself uses, so a committed advanced query renders
+		// pixel-for-pixel like a normal one:
+		//  - the filter chip comes from search.filters, a plain data array
+		//    PSSearchResults.renderFiltersHTML() reads directly and renders
+		//    itself (it's not a row inside results at all - confirmed in
+		//    battle-searchresults.tsx). addFilter() only ever accepts its
+		//    own hardcoded native filter types (type/move/ability/egggroup/
+		//    tier for Pokemon search), so an 'advanced' entry is written to
+		//    search.filters directly instead; getSearchDisplayName() falls
+		//    back to showing a name verbatim for any type it doesn't
+		//    recognize, filter()'s switch likewise just falls through
+		//    unmatched (leaving every row visible), and removeFilter() only
+		//    ever compares entries with a plain join(':') string-equality
+		//    check - so the chip's native x button correctly clears it back
+		//    to an unfiltered view with no extra code needed here.
+		//  - the tier headers and "Sort:" row come from the live engine's
+		//    own baseResults/baseIllegalResults (built by DexSearch.
+		//    getResults() in battle-dex-search.ts from a large, per-format
+		//    tier/banlist table), narrowed down to just the matched species
+		//    with the same adjacent-empty-header collapsing getResults()
+		//    itself does - reusing Showdown's real tier data and format
+		//    legality instead of re-deriving any of it by hand here.
+		function buildTierGroupedRows(engine, matchingIds, includeIllegal) {
+			// Lazily compute + cache on the engine itself, exactly mirroring
+			// DexSearch.getResults()'s own lazy-init of these two fields, so
+			// this stays a one-time cost per format (the same cache
+			// Showdown's own rendering would otherwise build and reuse
+			// anyway) and so illegalLabel()'s native "Illegal" row
+			// annotation (reading engine.illegalReasons) works on our rows
+			// exactly like it does on a normal search's.
+			if (!engine.baseResults) engine.baseResults = engine.getBaseResults();
+			if (!engine.baseIllegalResults) {
+				var legalityFilter = {};
+				engine.baseResults.forEach(function (result) {
+					if (result[0] === engine.searchType) legalityFilter[result[1]] = 1;
+				});
+				engine.baseIllegalResults = [];
+				engine.illegalReasons = {};
+				var table = engine.getTable();
+				for (var id in table) {
+					if (!(id in legalityFilter)) {
+						engine.baseIllegalResults.push([engine.searchType, id]);
+						engine.illegalReasons[id] = 'Illegal';
+					}
+				}
+			}
+
+			function collapseEmptyHeaders(rows) {
+				var out = [];
+				rows.forEach(function (row) {
+					if (out.length && row[0] === 'header' && out[out.length - 1][0] === 'header') {
+						out[out.length - 1] = row;
+					} else {
+						out.push(row);
+					}
+				});
+				if (out.length && out[out.length - 1][0] === 'header') out.pop();
+				return out;
+			}
+
+			var legalMatches = collapseEmptyHeaders(engine.baseResults.filter(function (row) {
+				return row[0] !== 'pokemon' || matchingIds[row[1]];
+			}));
+
+			var rows = [engine.sortRow || ['sortpokemon', '']].concat(legalMatches);
+
+			if (includeIllegal) {
+				var illegalMatches = engine.baseIllegalResults.filter(function (row) {
+					return matchingIds[row[1]];
+				});
+				if (illegalMatches.length) {
+					rows = rows.concat([['header', 'Illegal results']], illegalMatches);
+				}
+			}
+
+			return rows;
 		}
 
 		function runSearch(inputEl, commitAsFilter) {
-			console.log('[AdvSearch] ===== runSearch called ===== commitAsFilter =', commitAsFilter);
+			var __t0 = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
 			var query = inputEl.value;
-			console.log('[AdvSearch] runSearch: query =', JSON.stringify(query));
 			if (!looksLikeAdvancedQuery(query)) {
-				console.log('[AdvSearch] runSearch: looksLikeAdvancedQuery returned false, bailing out');
 				return;
 			}
-			console.log('[AdvSearch] runSearch: looksLikeAdvancedQuery returned true, proceeding');
 			var liveSearch = getLiveSearch();
 			if (!liveSearch) {
-				console.log('[AdvSearch] runSearch: getLiveSearch returned null, bailing out');
 				return;
 			}
 			var tokens = tokenize(query);
-			console.log('[AdvSearch] runSearch: tokenize result =', JSON.stringify(tokens));
 			if (!tokens) {
-				console.log('[AdvSearch] runSearch: tokenize returned null (unrecognized character), bailing out');
 				return;
 			}
 			var tree;
 			try {
 				tree = parseTokens(tokens);
-				console.log('[AdvSearch] runSearch: parseTokens succeeded, tree =', JSON.stringify(tree));
 			} catch (err) {
-				console.log('[AdvSearch] runSearch: parseTokens THREW an error:', err.message, '- bailing out');
 				return;
 			}
 			var allMons = getCachedPokemonData();
-			console.log('[AdvSearch] runSearch: total pokemon data available =', allMons.length);
 			var matchingMons = allMons.filter(function (mon) {
 				try { return evaluateNode(tree, mon); } catch (e) {
-					console.log('[AdvSearch] runSearch: evaluateNode threw for', mon.name, '-', e.message);
 					return false;
 				}
 			});
-			console.log('[AdvSearch] runSearch: matched', matchingMons.length, 'pokemon before legality filter');
-			if (hideIllegalMonsEnabled()) {
-				matchingMons = matchingMons.filter(function (mon) { return isLegalForCurrentFormat(liveSearch, mon.id); });
-				console.log('[AdvSearch] runSearch: hideIllegalMons enabled, narrowed to', matchingMons.length, 'legal-for-current-format pokemon');
+
+			// Old (jQuery) client: Search's own results view has no
+			// tier-header/sort-row concept at all - a flat, alphabetical
+			// list (with the hand-built chipHtml 'html' row, which that
+			// engine renders raw/unescaped) has always been its correct,
+			// normal shape, so this path is untouched.
+			var isOldClientSearch = typeof liveSearch.updateScroll === 'function' && 'resultSet' in liveSearch;
+			if (isOldClientSearch) {
+				var oldClientMons = matchingMons;
+				if (hideIllegalMonsEnabled()) {
+					oldClientMons = oldClientMons.filter(function (mon) { return isLegalForCurrentFormat(liveSearch, mon.id); });
+				}
+				var oldClientRows = oldClientMons.sort(function (a, b) { return a.name.localeCompare(b.name); })
+					.map(function (mon) { return ['pokemon', mon.id]; });
+				if (commitAsFilter) {
+					// Same 'html' row-type Showdown's own filter chips use
+					// (e.g. "Filters: Water x"), so it renders identically -
+					// then clear the input, matching how a committed native
+					// filter empties the search box.
+					var chipHtml = '<p>Filters: <button class="filter">' + query + ' <i class="fa fa-times-circle"></i></button></p>';
+					oldClientRows = [['html', chipHtml]].concat(oldClientRows);
+					inputEl.value = '';
+				}
+				applyResultsToLiveSearch(liveSearch, oldClientRows, query);
+				return;
 			}
-			var matchingRows = matchingMons.sort(function (a, b) { return a.name.localeCompare(b.name); })
-				.map(function (mon) { return ['pokemon', mon.id]; });
-			console.log('[AdvSearch] runSearch: final matched', matchingRows.length, 'pokemon:', matchingRows.map(function (r) { return r[1]; }));
+
+			// New (Preact) client: build a results list shaped exactly like
+			// a normal native one (see the long comment above
+			// buildTierGroupedRows for why) and commit via search.filters
+			// instead of a results row.
+			var engine = liveSearch.typedSearch;
+			if (!engine || typeof engine.getBaseResults !== 'function') {
+				return;
+			}
+			var includeIllegal = !hideIllegalMonsEnabled();
+			var matchingIds = {};
+			matchingMons.forEach(function (mon) { matchingIds[mon.id] = true; });
+
+			var newClientRows;
+			try {
+				newClientRows = buildTierGroupedRows(engine, matchingIds, includeIllegal);
+			} catch (e) {
+				newClientRows = matchingMons.sort(function (a, b) { return a.name.localeCompare(b.name); })
+					.map(function (mon) { return ['pokemon', mon.id]; });
+			}
+
 			if (commitAsFilter) {
-				// Same 'html' row-type Showdown's own filter chips use
-				// (e.g. "Filters: Water x"), so it renders identically -
-				// then clear the input, matching how a committed native
-				// filter empties the search box.
-				var chipHtml = '<p>Filters: <button class="filter">' + query + ' <i class="fa fa-times-circle"></i></button></p>';
-				matchingRows = [['html', chipHtml]].concat(matchingRows);
+				// Replaced wholesale rather than appended to any
+				// pre-existing native filters: this feature's results have
+				// never been intersected with other active filters (the
+				// whole dex is always what gets matched against), so
+				// leaving an old filter chip on screen next to this one
+				// would show it as if it were still narrowing the list,
+				// when it no longer has any effect on what's actually
+				// displayed.
+				liveSearch.filters = [['advanced', query]];
+				liveSearch.query = '';
+				liveSearch.sortCol = null;
+				liveSearch.reverseSort = false;
 				inputEl.value = '';
-				console.log('[AdvSearch] runSearch: commitAsFilter true, prepended filter chip html and cleared input');
+				watchForChipAppearing(inputEl, __t0);
 			}
-			applyResultsToLiveSearch(liveSearch, matchingRows, query);
-			console.log('[AdvSearch] ===== runSearch finished =====');
+			var __tBeforeApply = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+			applyResultsToLiveSearch(liveSearch, newClientRows, query);
+			var __tAfterApply = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+		}
+
+		// ─── locating the right input/results-list on either client ───
+		// Old client: one single, always-visible input literally named
+		// "pokemon" is the only Pokemon search box there is - no separate
+		// zoomed mode exists at all.
+		//
+		// New (Preact) client: that same inline "pokemon" field is only
+		// ever a short, inert-looking preview - the instant it's focused
+		// (confirmed in battle-team-editor.tsx's openFocusTextbox/
+		// changeFocus), the whole set editor swaps into a zoomed
+		// "team-focus-editor" view and keyboard focus moves to a
+		// SEPARATE, shared search box literally named "value" (the same
+		// one the Ability/Item/Move fields also use once *they're*
+		// focused instead - there's only ever one at a time). So typing
+		// an advanced query on the new client never touches
+		// input[name="pokemon"] at all, which is why every listener
+		// below that only checked for that name never fired there.
+		// editor.innerFocus.type tells us which field is actually being
+		// served right now, same signal already used by the click
+		// handler further down for liveSearch.typedSearch.searchType.
+		function isPokemonSearchBox(el) {
+			if (!el || !el.matches) return false;
+			if (el.matches('input[name="pokemon"]')) return true;
+			if (el.matches('input[name="value"]') && win.editor && win.editor.innerFocus && win.editor.innerFocus.type === 'pokemon') return true;
+			return false;
+		}
+
+		// Same idea for finding the box to insert a clicked suggestion
+		// into (see insertIntoQuery below) - on the new client that's the
+		// zoomed-in "value" box when it's genuinely serving Pokemon
+		// search, falling back to the old client's literal "pokemon"
+		// input otherwise.
+		function getActivePokemonSearchInput() {
+			if (win.editor && win.editor.innerFocus && win.editor.innerFocus.type === 'pokemon') {
+				var valueEl = document.querySelector('input[name="value"]');
+				if (valueEl) return valueEl;
+			}
+			return document.querySelector('input[name="pokemon"]');
+		}
+
+		// Confirms a clicked suggestion link actually came from a
+		// search-results list, the way liveSearch.el.contains(...) did
+		// for the old jQuery Search class. The new DexSearch class has no
+		// .el of its own at all (it's a plain data/engine object, not a
+		// view - confirmed directly in battle-dex-search.ts), so
+		// liveSearch.el.contains(...) was silently false on every single
+		// click there, permanently bailing out of this whole handler.
+		// PSSearchResults (battle-searchresults.tsx) is what actually
+		// renders these links, always inside one of these classes.
+		function isSearchResultClick(liveSearch, entryEl) {
+			if (liveSearch.el) return liveSearch.el.contains(entryEl);
+			return !!entryEl.closest('.set-searchresults, .searchresults, .dexlist');
 		}
 
 		// ---- Inserting into the query instead of committing immediately ----
@@ -2619,7 +4134,27 @@
 		// list is left completely untouched, since there's no custom
 		// dropdown of ours to navigate anymore.
 		function getTrailingTermInfo(fullValue) {
-			var match = /(?:&&|\|\||\(|^)(\s*)(!?)(\s*)([a-zA-Z0-9]*)$/.exec(fullValue);
+			// The trailing word-run has to accept the exact same shape
+			// tokenize()'s own word alternative does
+			// ([a-zA-Z0-9]+(?:\s+[a-zA-Z0-9]+)*, wrapped here in an outer
+			// `?` so "nothing typed yet right after an operator" still
+			// matches too) - a bare [a-zA-Z0-9]* cannot match a multi-word
+			// term like "Fake Out" at all, since the embedded space isn't
+			// in that character class. With the old pattern, the moment a
+			// second term's own name contained a space, this returned
+			// null for every keystroke from that space onward (nothing
+			// left to isolate), which made the caller (the keyup handler
+			// below) block native autocomplete entirely instead of
+			// isolating-and-restoring it - so the suggestion list just
+			// froze at whatever it last showed and never caught up to
+			// the new term, exactly like the term after the separator
+			// wasn't being typed at all. tokenize()/parseTokens()/
+			// evaluateNode() never had this bug - a committed search
+			// (Enter) already matched both terms correctly - this only
+			// ever broke the live, uncommitted preview and the
+			// click-a-suggestion-to-insert path (insertIntoQuery), both
+			// of which call this same function.
+			var match = /(?:&&|\|\||\(|^)(\s*)(!?)(\s*)((?:[a-zA-Z0-9]+(?:\s+[a-zA-Z0-9]+)*)?)$/.exec(fullValue);
 			if (!match) return null;
 			return { partial: match[4], matchStart: match.index + match[0].length - match[4].length };
 		}
@@ -2632,7 +4167,6 @@
 			var info = getTrailingTermInfo(inputEl.value) || { matchStart: inputEl.value.length };
 			inputEl.value = replaceTrailingTerm(inputEl.value, info, name);
 			inputEl.focus();
-			console.log('[AdvSearch] insertIntoQuery: inserted', JSON.stringify(name), '- new value =', JSON.stringify(inputEl.value));
 		}
 
 		document.addEventListener('click', function (e) {
@@ -2640,8 +4174,8 @@
 			var entryEl = e.target.closest ? e.target.closest('a[data-entry]') : null;
 			if (!entryEl) return;
 			var liveSearch = getLiveSearch();
-			if (!liveSearch || !liveSearch.el || !liveSearch.el.contains(entryEl)) return;
-			var inputEl = document.querySelector('input[name="pokemon"]');
+			if (!liveSearch || !isSearchResultClick(liveSearch, entryEl)) return;
+			var inputEl = getActivePokemonSearchInput();
 			if (!inputEl) return;
 			// win.search is a single, shared global that Showdown
 			// reassigns whenever a different search-powered field
@@ -2652,8 +4186,28 @@
 			// redirected into the Pokemon search box instead of that
 			// field's own native behavior.
 			var boundInputEl = liveSearch.$inputEl && liveSearch.$inputEl[0];
-			if (boundInputEl !== inputEl) {
-				console.log('[AdvSearch] click: live search is bound to a different input (Ability/Moves/Item field, not the Pokemon search box) - letting it handle this click normally');
+			var isWrongField;
+			if (liveSearch.$inputEl) {
+				// Old jQuery Search class (win.search): compare against
+				// the specific input element it's bound to, as above.
+				isWrongField = (boundInputEl !== inputEl);
+			} else if (liveSearch.typedSearch) {
+				// New/shared DexSearch engine (win.editor.search, used by
+				// the Preact team editor): it has no $inputEl to compare
+				// against at all - each field (Pokemon/Ability/Item/Move)
+				// is instead its own real <input name="..."> element, and
+				// the search engine tracks which one it's currently
+				// serving via typedSearch.searchType directly. Same
+				// shared-instance ambiguity as the jQuery case, just a
+				// different signal to read it from.
+				isWrongField = (liveSearch.typedSearch.searchType !== 'pokemon');
+			} else {
+				// Unrecognized shape - matches the old behavior of never
+				// having blocked on this check before it existed: don't
+				// block, just let the click through as a query insertion.
+				isWrongField = false;
+			}
+			if (isWrongField) {
 				return;
 			}
 			var entryParts = entryEl.dataset.entry.split('|');
@@ -2662,35 +4216,69 @@
 			// clicking one should use Showdown's own default behavior
 			// completely untouched, not get inserted into the query.
 			if (entryParts[0] === 'pokemon') {
-				console.log('[AdvSearch] click: pokemon-category entry, letting Showdown handle this click normally -', entryEl.dataset.entry);
 				return;
 			}
 			var displayName = entryParts[1];
 			if (!displayName) return;
-			console.log('[AdvSearch] click: intercepted native suggestion click, data-entry =', entryEl.dataset.entry);
 			e.preventDefault();
 			e.stopImmediatePropagation();
 			insertIntoQuery(inputEl, displayName);
 		}, true);
 
 		// Once the query contains our syntax, Showdown's own native
-		// handling for this input is fully blocked (via
+		// handling for this input is blocked/redirected (via
 		// stopImmediatePropagation in the capturing phase) rather than
 		// left running alongside ours - letting both run and betting on
 		// timing to make ours win is exactly what caused the earlier
-		// event-phase and stopPropagation bugs. Blocking outright avoids
-		// that whole category of problem. Normal typing (before any
+		// event-phase and stopPropagation bugs. Normal typing (before any
 		// special syntax appears) is completely unaffected either way.
 		document.addEventListener('input', function (e) {
 			if (!isAdvancedSearchEnabled()) return;
 			var el = e.target;
-			if (!el.matches || !el.matches('input[name="pokemon"]')) return;
+			if (!isPokemonSearchBox(el)) return;
 			var isAdvanced = looksLikeAdvancedQuery(el.value);
-			console.log('[AdvSearch] input event: value =', JSON.stringify(el.value), '| looksLikeAdvancedQuery =', isAdvanced);
-			if (isAdvanced) {
+			if (!isAdvanced) return;
+
+			// Old client's own live refresh comes from the separate
+			// keyup-based chartKeyUp handler further down (isolate/
+			// restore happens there instead, on the literal "pokemon"
+			// box only) - blocking 'input' outright here just silences a
+			// second, redundant native search-on-input path alongside
+			// it for that client, and has always worked correctly left
+			// exactly as-is.
+			if (el.matches('input[name="pokemon"]')) {
 				e.stopImmediatePropagation();
-				console.log('[AdvSearch] input event: stopImmediatePropagation called (blocking Showdown native input handling)');
+				return;
 			}
+
+			// New (Preact) client's live refresh runs ENTIRELY off this
+			// same 'input' event - TeamEditor.updateSearch, wired via
+			// onInput={this.updateSearch} in battle-team-editor.tsx,
+			// reads ev.currentTarget.value directly and has no competing
+			// keyup-driven path the way old client does. Unconditionally
+			// blocking 'input' here (as this used to do for both clients
+			// alike) left the new client's search results frozen at
+			// whatever they last showed the instant the query first
+			// became "advanced" - not just while a space-containing
+			// second term was present, since nothing ever isolated or
+			// restored anything on this path before. The <input> itself
+			// has no Preact value= binding (confirmed in the source -
+			// it's uncontrolled), so, exactly like the old client's
+			// keyup fix below, it's safe to temporarily swap in just the
+			// trailing term being typed, let this same event carry on
+			// (no stopImmediatePropagation in this branch) so Preact's
+			// own updateSearch/search.find runs and renders against that
+			// term alone, then restore the full expression right after.
+			var info = getTrailingTermInfo(el.value);
+			if (!info) {
+				e.stopImmediatePropagation();
+				return;
+			}
+			var fullValue = el.value;
+			el.value = info.partial;
+			setTimeout(function () {
+				el.value = fullValue;
+			}, 0);
 		}, true);
 
 		// On Enter: commits the current expression as a persistent
@@ -2708,17 +4296,14 @@
 			if (!isAdvancedSearchEnabled()) return;
 			if (e.key !== 'Enter') return;
 			var el = e.target;
-			if (!el.matches || !el.matches('input[name="pokemon"]')) return;
+			if (!isPokemonSearchBox(el)) return;
 			var isAdvanced = looksLikeAdvancedQuery(el.value);
-			console.log('[AdvSearch] === keydown Enter === value =', JSON.stringify(el.value), '| isAdvanced =', isAdvanced);
 			if (!isAdvanced) {
-				console.log('[AdvSearch] keydown: not an advanced query - letting Showdown handle Enter normally');
 				return;
 			}
 			e.preventDefault();
 			e.stopImmediatePropagation();
 			justHandledByUs = true;
-			console.log('[AdvSearch] keydown: preventDefault + stopImmediatePropagation called, calling runSearch(el, true) now');
 			runSearch(el, true);
 		}, true);
 
@@ -2738,6 +4323,16 @@
 		// full, visible expression right after, once native handling
 		// has had its turn (via setTimeout, so it runs after the
 		// current, synchronous event-dispatch cycle completes).
+		//
+		// Deliberately still old-client-only (checks the literal
+		// "pokemon" name directly, not isPokemonSearchBox): the native
+		// behavior this works around - Showdown re-searching on every
+		// keyup via chartKeyUp - doesn't exist on the new client at all,
+		// which instead re-searches on the "value" box's own input event
+		// (already fully blocked by the input listener above once
+		// advanced syntax appears). Nothing on the new client ever reads
+		// mid-keystroke, so there's nothing here for it to isolate
+		// against; matching it would just be a harmless no-op.
 		document.addEventListener('keyup', function (e) {
 			if (!isAdvancedSearchEnabled()) return;
 			var el = e.target;
@@ -2747,7 +4342,6 @@
 				justHandledByUs = false;
 				e.preventDefault();
 				e.stopImmediatePropagation();
-				console.log('[AdvSearch] keyup: blocking native (post-commit cleanup)');
 				return;
 			}
 
@@ -2761,16 +4355,13 @@
 				// handling entirely for this instant, since there's no
 				// meaningful term to autocomplete against anyway.
 				e.stopImmediatePropagation();
-				console.log('[AdvSearch] keyup: no isolatable trailing term, blocking native handling entirely for this instant');
 				return;
 			}
 
 			var fullValue = el.value;
 			el.value = info.partial;
-			console.log('[AdvSearch] keyup: temporarily isolated trailing term for native autocomplete:', JSON.stringify(info.partial), '(full value was', JSON.stringify(fullValue) + ')');
 			setTimeout(function () {
 				el.value = fullValue;
-				console.log('[AdvSearch] keyup: restored full value after native autocomplete ran:', JSON.stringify(fullValue));
 			}, 0);
 		}, true);
 
@@ -2787,7 +4378,7 @@
 		document.addEventListener('keyup', function (e) {
 			if (!hideIllegalMonsEnabled()) return;
 			var el = e.target;
-			if (!el.matches || !el.matches('input[name="pokemon"]')) return;
+			if (!isPokemonSearchBox(el)) return;
 			setTimeout(function () {
 				var liveSearch = getLiveSearch();
 				if (!liveSearch) return;
@@ -2797,12 +4388,10 @@
 						return !Array.isArray(row) || row[0] !== 'pokemon' || isLegalForCurrentFormat(liveSearch, row[1]);
 					}));
 					if (filtered.length !== rows.length) {
-						console.log('[AdvSearch] post-filter (independent of advanced syntax): removed', rows.length - filtered.length, 'illegal mons/orphaned headers from', rows.length, 'total rows');
 						liveSearch.resultSet = filtered;
 						liveSearch.renderedIndex = 0;
 						liveSearch.renderingDone = false;
 						liveSearch.updateScroll(true);
-						console.log('[AdvSearch] post-filter: updateScroll(true) called, liveSearch.el.innerHTML is now:', liveSearch.el && liveSearch.el.innerHTML);
 					}
 					return;
 				}
@@ -2812,7 +4401,6 @@
 						return !Array.isArray(row) || row[0] !== 'pokemon' || isLegalForCurrentFormat(liveSearch, row[1]);
 					}));
 					if (filtered2.length !== rows2.length) {
-						console.log('[AdvSearch] post-filter (Preact-style, independent of advanced syntax): removed', rows2.length - filtered2.length, 'illegal mons/orphaned headers');
 						liveSearch.results = filtered2;
 						if (liveSearch.resultsComponent && typeof liveSearch.resultsComponent.forceUpdate === 'function') {
 							liveSearch.resultsComponent.forceUpdate();
@@ -2826,6 +4414,17 @@
 	// ============================================================
 	// TEAMBUILDER SET-PANEL BUTTON CLEANUP
 	// ============================================================
+	// New (Preact) client note: this whole feature is old-client-only by
+	// nature, not just by implementation. The new client's per-Pokemon
+	// set editor (battle-team-editor.tsx) has no .setmenu/copySet-style
+	// action row at all - copy/delete/move live at the per-team-member
+	// level there (editor.copySet/deleteSet/moveSet, its own separate
+	// buttons unrelated to these names) and import/export is a whole-team
+	// action on the overview screen instead. There's nothing to hide on
+	// the new client, so the lookup below (which is entirely
+	// app.rooms['teambuilder']/Storage-based) already no-ops there safely
+	// without needing a client check of its own.
+	//
 	// Hides Copy, Import/Export, Move, and Delete specifically on the
 	// same set panel where the Teambuilder quick-links feature (further
 	// below, a separate section/scope) adds its Serebii/MunchStats/NCP
@@ -3068,6 +4667,320 @@
 				});
 			};
 		}
+
+		// ─── OptionsPanel patch (new client) ───
+		// The new Preact client's Options popup is a different component
+		// entirely (OptionsPanel in panel-popups.tsx), registered via
+		// PS.addRoomType() - which is how it ends up reachable here as
+		// win.PS.roomTypes['options'], even though it's never assigned to
+		// a window global of its own. There's no win.OptionsPopup on this
+		// client, and the whole startObservingBattle() bootstrap above is
+		// gated behind win.app, so none of this ever ran there - that's
+		// why the custom sections just didn't appear.
+		//
+		// Preact fully regenerates this panel's DOM from render() on every
+		// update, but its diffing only ever touches nodes it created
+		// itself - plain DOM nodes inserted by us are invisible to it and
+		// never get cleaned up. That's the opposite problem from the
+		// jQuery popup above (whose update() replaces everything, so it
+		// mostly doesn't need to worry about leftovers): here we have to
+		// explicitly guard against inserting a second copy on every
+		// re-render ourselves.
+		function ensureQolSettingsStyle() {
+			if (!document.getElementById('qol2-settings-style')) {
+				var st = document.createElement('style'); st.id = 'qol2-settings-style';
+				st.textContent = '.qol2-section-header{cursor:pointer;user-select:none;display:flex;align-items:center;justify-content:space-between;padding-right:4px;}.qol2-section-header:hover strong{text-decoration:underline;}.qol2-section-chevron{font-size:10px;color:#888;}.qol2-section-body.collapsed{display:none;}' +
+					// Native new-client section headers (General/Appearance/Chat)
+					// are plain <h3> text, not <p><strong>, so they can't share the
+					// chevron-span markup the custom sections above use (appending
+					// a real element inside an <h3> that Preact still thinks has
+					// only a single text child is exactly the kind of DOM mutation
+					// that's risky to make stick - see wireNativeSectionCollapse).
+					// A CSS-only ::after chevron sidesteps that: it never touches
+					// the h3's own children, so there's nothing for Preact's
+					// diffing to disagree with.
+					'.qol2-native-section-header{cursor:pointer;user-select:none;}.qol2-native-section-header:hover{text-decoration:underline;}.qol2-native-section-header::after{content:\'\\25BC\';display:inline-block;margin-left:6px;font-size:10px;color:#888;text-decoration:none;}.qol2-native-section-header.collapsed::after{content:\'\\25B6\';}';
+				document.head.appendChild(st);
+			}
+		}
+
+		// Collapse state is keyed off the section's title, same as the old
+		// client's own version does (it reads the rendered <strong> text) -
+		// matching that exactly means a section collapsed on one client
+		// stays collapsed on the other, since both read/write the same
+		// qol2-settings localStorage key.
+		function qolSectionPrefKey(title) { return 'section-' + title.toLowerCase().replace(/\s+/g, '-'); }
+
+		function buildQolSectionHTML(id, title, bodyHtml) {
+			var collapsed = getQolPref(qolSectionPrefKey(title), false);
+			return '<hr /><p class="qol2-section-header" id="qol2-' + id + '-header"><strong>' + title + '</strong><span class="qol2-section-chevron">' + (collapsed ? '&#9654;' : '&#9660;') + '</span></p>' +
+				'<div class="qol2-section-body' + (collapsed ? ' collapsed' : '') + '" id="qol2-' + id + '-body">' + bodyHtml + '</div>';
+		}
+
+		function wireQolSectionToggle(root, id, title) {
+			var header = root.querySelector('#qol2-' + id + '-header');
+			var body = root.querySelector('#qol2-' + id + '-body');
+			if (!header || !body || header._qolWired) return;
+			header._qolWired = true;
+			var sk = qolSectionPrefKey(title);
+			var chevron = header.querySelector('.qol2-section-chevron');
+			header.addEventListener('click', function () {
+				var isCollapsed = body.classList.contains('collapsed');
+				body.classList.toggle('collapsed', !isCollapsed);
+				if (chevron) chevron.innerHTML = isCollapsed ? '&#9660;' : '&#9654;';
+				setQolPref(sk, !isCollapsed);
+			});
+		}
+
+		// Makes the NATIVE sections (General/Appearance/Chat) collapsible too,
+		// matching the old client's own patchOptionsPopup - which doesn't just
+		// add custom sections, it wraps EVERY <p><strong> header it finds,
+		// native ones included. The new client renders its native headers as
+		// bare <h3>text</h3> rather than <p><strong>, so this needs its own,
+		// more careful version: unlike the custom sections (which are built
+		// from scratch as plain HTML, so wrapping them in a real container is
+		// risk-free), these <p> elements between one <h3> and the next <hr>
+		// are nodes Preact itself created and is still tracking. Moving them
+		// into a new wrapper div would reparent nodes out from under Preact's
+		// own bookkeeping, and the next re-render could try to move them back
+		// (or worse) since Preact diffs by comparing its old vnode tree to the
+		// new one, not by reading what's actually in the live DOM.
+		// So instead of moving anything, this only ever does two kinds of
+		// change Preact's diffing is guaranteed to leave alone because they're
+		// never part of what it compares old-vnode-props to new-vnode-props
+		// for on these elements: adding a CSS class (these elements have no
+		// native class prop of their own) and setting inline style.display
+		// directly (same - none of them carry a native style prop either).
+		// Both survive indefinitely because Preact only ever re-applies a DOM
+		// prop when its OWN tracked value for it changed between renders -
+		// since it never set class/style here to begin with, it has nothing
+		// to compare and never touches what we've added.
+		function wireNativeSectionCollapse(root) {
+			var headers = root.querySelectorAll('h3');
+			for (var i = 0; i < headers.length; i++) {
+				// Delegated to its own function (rather than a closure built
+				// directly in this loop body) specifically so each header's
+				// click handler closes over its OWN members/sk - a `var`
+				// declared inside a for-loop body is scoped to the whole
+				// function, not per-iteration, so three closures built
+				// directly in this loop would all end up sharing a single
+				// `members`/`sk` (whatever the last iteration left them as).
+				// That would make every header's chevron flip independently
+				// while all of them actually hid/showed and persisted
+				// whichever section was wired last.
+				wireOneNativeHeader(headers[i]);
+			}
+		}
+
+		function wireOneNativeHeader(h3) {
+			if (h3.classList.contains('qol2-native-section-header')) return;
+			var title = h3.textContent.trim();
+			if (!title) return;
+			var members = [];
+			var node = h3.nextElementSibling;
+			while (node && node.tagName !== 'HR') { members.push(node); node = node.nextElementSibling; }
+			if (!members.length) return;
+			h3.classList.add('qol2-native-section-header');
+			var sk = qolSectionPrefKey(title);
+			if (getQolPref(sk, false)) {
+				h3.classList.add('collapsed');
+				members.forEach(function (m) { m.style.display = 'none'; });
+			}
+			h3.addEventListener('click', function () {
+				var isCollapsed = h3.classList.toggle('collapsed');
+				members.forEach(function (m) { m.style.display = isCollapsed ? 'none' : ''; });
+				setQolPref(sk, isCollapsed);
+			});
+		}
+
+		function injectQolOptionsNewClient(panel) {
+			var root = panel.base;
+			if (!root || root.querySelector('#qol2-newclient-sections')) return;
+			ensureQolSettingsStyle();
+
+			// The old/new client switcher ("This is the new client." / Default
+			// dropdown / "Use old client temporarily") is Showdown's own
+			// native <div class="construction"> block (confirmed directly
+			// from panel-popups.tsx's OptionsPanel), sitting between the
+			// General and Appearance <h3> sections with no header of its own -
+			// which is exactly why wireNativeSectionCollapse below always
+			// skips it (it only ever looks at <h3> elements, and nothing
+			// precedes this one). Giving it a synthetic <h3> right before it
+			// is all that's needed to make it collapsible by that exact same
+			// mechanism: wireNativeSectionCollapse's very next pass over the
+			// DOM iterates EVERY <h3> it finds regardless of who created it,
+			// so it picks this new one up, walks forward, and finds the
+			// construction div as its one and only member (the next element
+			// is the <hr> leading into Appearance, exactly where that walk is
+			// supposed to stop) - no new collapse logic needed at all.
+			var constructionDiv = root.querySelector('.construction');
+			if (constructionDiv && !root.querySelector('#qol2-client-switcher-header')) {
+				constructionDiv.insertAdjacentHTML('beforebegin', '<h3 id="qol2-client-switcher-header">Client</h3>');
+			}
+			wireNativeSectionCollapse(root);
+
+			var otsVal = getQolPref('ots', 'ask');
+			var musicTracksEmpty = MUSIC_TRACKS.length === 0;
+			var modeVal = (battleMode === 'active' || battleMode === 'paused') ? 'battle' : (tbMode ? 'teambuilder' : 'default');
+
+			var html = '<div id="qol2-newclient-sections">' +
+				buildQolSectionHTML('battle', 'Battle', [
+					'<p><label class="optlabel">Open Team Sheets:<select name="qol2-ots" class="select">',
+					'<option value="ask"' + (otsVal === 'ask' ? ' selected' : '') + '>Ask me each time</option>',
+					'<option value="accept"' + (otsVal === 'accept' ? ' selected' : '') + '>Always accept</option>',
+					'<option value="reject"' + (otsVal === 'reject' ? ' selected' : '') + '>Always reject</option>',
+					'</select></label></p>',
+					'<p><label class="checkbox"><input type="checkbox" name="qol2-autocopyreplay"' + (getQolPref('autocopyreplay', false) ? ' checked' : '') + ' /> Auto-copy replay link when battle ends</label></p>',
+					'<p><label class="checkbox"><input type="checkbox" name="qol2-autoclosebattle"' + (getQolPref('autoclosebattle', false) ? ' checked' : '') + ' /> Auto-close battle after replay link is copied</label></p>',
+					'<p><label class="checkbox"><input type="checkbox" name="qol2-closeforfeit"' + (getQolPref('closeforfeit', true) ? ' checked' : '') + ' /> Close battle after forfeiting</label></p>',
+				].join('')) +
+				buildQolSectionHTML('music', 'Music', [
+					'<p><label class="checkbox"><input type="checkbox" name="qol2-showdownbgm"' + (musicTracksEmpty || getQolPref('includeShowdownBgm', true) ? ' checked' : '') + (musicTracksEmpty ? ' disabled' : '') + ' /> Include Showdown\'s default battle music</label></p>',
+					musicTracksEmpty ? '<p style="color:#777;font-size:8pt;margin:2px 0 4px;">Can\'t be turned off while MUSIC_TRACKS is empty - there\'d be nothing else to play.</p>' : '',
+				].join('')) +
+				buildQolSectionHTML('tb', 'Teambuilder', [
+					'<p><label class="checkbox"><input type="checkbox" name="qol2-tbquicklinks"' + (getQolPref('tbquicklinks', false) ? ' checked' : '') + ' /> Show Pokémon quick-links in Teambuilder</label></p>',
+					'<p><label class="checkbox"><input type="checkbox" name="qol2-otsnature"' + (getQolPref('otsnature', true) ? ' checked' : '') + ' /> Include Nature in OTS Pokepaste export</label></p>',
+					'<p><label class="checkbox"><input type="checkbox" name="qol2-advsearch"' + (getQolPref('advancedSearch', true) ? ' checked' : '') + ' /> Use advanced Teambuilder search (boolean logic, stat filters, Mega/Gmax)</label></p>',
+					'<p><label class="checkbox"><input type="checkbox" name="qol2-hideillegal"' + (getQolPref('hideIllegalMons', false) ? ' checked' : '') + ' /> Hide Pokémon illegal in the current format from advanced search results</label></p>',
+				].join('')) +
+				buildQolSectionHTML('modes', 'Modes', [
+					'<p><label class="checkbox"><input type="radio" name="qol2-mode" value="default"' + (modeVal === 'default' ? ' checked' : '') + ' /> <strong>Default Mode</strong></label></p>',
+					'<p><label class="checkbox"><input type="radio" name="qol2-mode" value="battle"' + (modeVal === 'battle' ? ' checked' : '') + ' /> <strong>Battle Mode</strong></label></p>',
+					'<div id="qol2-bm-opts-new" style="margin-left:16px;' + (modeVal === 'battle' ? '' : 'display:none;') + '">',
+					'<p style="color:#777;font-size:8pt;margin:2px 0 4px;">Auto-searches your current format. Replays are copied and saved for export.</p>',
+					'<p><button type="button" class="button" name="qol2-bm-status-new" style="font-size:8pt;">' + (battleMode === 'active' ? '<i class="fa fa-pause"></i> Pause' : '<i class="fa fa-play"></i> Resume') + '</button></p>',
+					'</div>',
+					'<p><label class="checkbox"><input type="radio" name="qol2-mode" value="teambuilder"' + (modeVal === 'teambuilder' ? ' checked' : '') + ' /> <strong>Teambuilder Mode</strong></label></p>',
+					'<div id="qol2-tb-opts-new" style="margin-left:16px;' + (modeVal === 'teambuilder' ? '' : 'display:none;') + '">',
+					'<p style="color:#777;font-size:8pt;margin:2px 0 4px;">Opens Teambuilder, MunchStats, and the Nerd of Now damage calc.</p>',
+					'<p><label class="checkbox"><input type="checkbox" name="qol2-tb-away"' + (getQolPref('tb-away', false) ? ' checked' : '') + ' /> Set status to Away on start</label></p>',
+					'</div>',
+				].join('')) +
+				'</div>';
+
+			// Mirrors the old client's placement: just before the LAST
+			// <hr>, i.e. between the native options and the final
+			// login/logout button bar.
+			var hrs = root.querySelectorAll('hr');
+			var lastHr = hrs.length ? hrs[hrs.length - 1] : null;
+			if (lastHr) lastHr.insertAdjacentHTML('beforebegin', html);
+			else root.insertAdjacentHTML('beforeend', html);
+
+			// The new client's modal popups (OptionsPanel included) have
+			// no close button of their own - they're dismissed via the
+			// backdrop or Escape - so add the same "X" the old client
+			// gets. data-cmd is Showdown's own declarative command
+			// attribute, handled by delegated click listening higher up
+			// the tree, so a plain button carrying it works the same
+			// whether Preact or innerHTML created it.
+			if (!root.querySelector('.qol2-close-btn')) {
+				root.insertAdjacentHTML('afterbegin', '<div style="text-align:right;margin-bottom:2px;"><button name="close" class="closebutton qol2-close-btn" data-cmd="/close" tabindex="-1" aria-label="Close"><i class="fa fa-times-circle"></i></button></div>');
+			}
+
+			[['battle', 'Battle'], ['music', 'Music'], ['tb', 'Teambuilder'], ['modes', 'Modes']].forEach(function (pair) {
+				wireQolSectionToggle(root, pair[0], pair[1]);
+			});
+
+			var q = function (sel) { return root.querySelector(sel); };
+			var otsSelect = q('select[name="qol2-ots"]');
+			if (otsSelect) otsSelect.addEventListener('change', function () { setQolPref('ots', this.value); });
+			var autocopyEl = q('input[name="qol2-autocopyreplay"]');
+			if (autocopyEl) autocopyEl.addEventListener('change', function () { setQolPref('autocopyreplay', this.checked); });
+			var autocloseEl = q('input[name="qol2-autoclosebattle"]');
+			if (autocloseEl) autocloseEl.addEventListener('change', function () {
+				setQolPref('autoclosebattle', this.checked);
+				if (this.checked) { setQolPref('closeforfeit', false); var cf = q('input[name="qol2-closeforfeit"]'); if (cf) cf.checked = false; }
+			});
+			var closeforfeitEl = q('input[name="qol2-closeforfeit"]');
+			if (closeforfeitEl) closeforfeitEl.addEventListener('change', function () {
+				setQolPref('closeforfeit', this.checked);
+				if (this.checked) { setQolPref('autoclosebattle', false); var ac = q('input[name="qol2-autoclosebattle"]'); if (ac) ac.checked = false; }
+			});
+			var bgmEl = q('input[name="qol2-showdownbgm"]');
+			if (bgmEl) bgmEl.addEventListener('change', function () { setQolPref('includeShowdownBgm', this.checked); });
+			var qlEl = q('input[name="qol2-tbquicklinks"]');
+			if (qlEl) qlEl.addEventListener('change', function () { setQolPref('tbquicklinks', this.checked); });
+			var natureEl = q('input[name="qol2-otsnature"]');
+			if (natureEl) natureEl.addEventListener('change', function () { setQolPref('otsnature', this.checked); });
+			var advEl = q('input[name="qol2-advsearch"]');
+			if (advEl) advEl.addEventListener('change', function () { setQolPref('advancedSearch', this.checked); });
+			var hideEl = q('input[name="qol2-hideillegal"]');
+			if (hideEl) hideEl.addEventListener('change', function () { setQolPref('hideIllegalMons', this.checked); });
+
+			// Real radio inputs (rather than old client's three independent
+			// checkboxes) so mutual exclusivity is enforced by the browser
+			// itself: this section only ever renders once (the idempotency
+			// guard at the top of this function), so there's no re-render to
+			// recompute which one should be checked after a change the way
+			// old client's own patchOptionsPopup does - sibling state has to
+			// be kept in sync by hand instead, exactly like the
+			// autoclosebattle/closeforfeit pair above already does.
+			var modeRadios = root.querySelectorAll('input[name="qol2-mode"]');
+			for (var mi = 0; mi < modeRadios.length; mi++) {
+				modeRadios[mi].addEventListener('change', function () {
+					if (!this.checked) return;
+					if (this.value === 'default') {
+						if (battleMode !== 'off') bmEndNewClient();
+						if (tbMode) tbEndNewClient();
+					} else if (this.value === 'battle') {
+						bmStartNewClient();
+					} else if (this.value === 'teambuilder') {
+						tbStartNewClient();
+					}
+					// bmStartNewClient() can fail synchronously (the team-validation
+					// guard in bmTrySearchNewClient calling bmEndNewClient() right
+					// back) when the current format needs a team and none is
+					// available - reflect what ACTUALLY ended up running rather than
+					// blindly trusting which radio was clicked, so the panel doesn't
+					// keep showing "Battle Mode is running" after a failed start.
+					var curModeVal = (battleMode === 'active' || battleMode === 'paused') ? 'battle' : (tbMode ? 'teambuilder' : 'default');
+					if (curModeVal !== this.value) {
+						var fallbackRadio = q('input[name="qol2-mode"][value="' + curModeVal + '"]');
+						if (fallbackRadio) fallbackRadio.checked = true;
+					}
+					var bmOptsDiv = q('#qol2-bm-opts-new');
+					var tbOptsDiv = q('#qol2-tb-opts-new');
+					var statusBtn = q('button[name="qol2-bm-status-new"]');
+					if (bmOptsDiv) bmOptsDiv.style.display = (curModeVal === 'battle') ? '' : 'none';
+					if (tbOptsDiv) tbOptsDiv.style.display = (curModeVal === 'teambuilder') ? '' : 'none';
+					if (statusBtn) statusBtn.innerHTML = '<i class="fa fa-pause"></i> Pause';
+				});
+			}
+			var bmStatusBtnNew = q('button[name="qol2-bm-status-new"]');
+			if (bmStatusBtnNew) bmStatusBtnNew.addEventListener('mousedown', function (e) {
+				e.preventDefault();
+				if (battleMode === 'active') {
+					bmPauseNewClient();
+					this.innerHTML = '<i class="fa fa-play"></i> Resume';
+				} else if (battleMode === 'paused') {
+					battleMode = 'active'; renderBattleModeWidgetNewClient(); bmTrySearchNewClient();
+					this.innerHTML = '<i class="fa fa-pause"></i> Pause';
+				}
+			});
+			var tbAwayElNew = q('input[name="qol2-tb-away"]');
+			if (tbAwayElNew) tbAwayElNew.addEventListener('change', function () { setQolPref('tb-away', this.checked); });
+		}
+
+		function patchOptionsPanelNewClient() {
+			var RoomType = win.PS && win.PS.roomTypes && win.PS.roomTypes['options'];
+			if (!RoomType || RoomType.prototype._qolPatchedNewClient) return;
+			RoomType.prototype._qolPatchedNewClient = true;
+			var origMount = RoomType.prototype.componentDidMount;
+			var origUpdate = RoomType.prototype.componentDidUpdate;
+			RoomType.prototype.componentDidMount = function () {
+				if (origMount) origMount.call(this);
+				injectQolOptionsNewClient(this);
+			};
+			RoomType.prototype.componentDidUpdate = function () {
+				if (origUpdate) origUpdate.call(this);
+				injectQolOptionsNewClient(this);
+			};
+		}
+		(function tryPatchOptionsPanelNewClient() {
+			if (win.PS && win.PS.roomTypes && win.PS.roomTypes['options']) patchOptionsPanelNewClient();
+			else setTimeout(tryPatchOptionsPanelNewClient, 300);
+		})();
 
 		// ─── OTS ───
 		var patchedRooms = new Set();
@@ -3433,6 +5346,315 @@
 
 		var bmHookedRooms = new Set();
 
+		// ─── Battle Mode (new client) ───
+		// Reuses battleMode/bmReplays/bmFormat/bmBattleCount/bmBo3Series/
+		// bmBo3WaitUntil as-is: exactly one client is ever active in a given
+		// page load, so there's no risk of the two clients' Battle Mode
+		// state colliding. bmTeamIndex (old client's array-index team
+		// reference) doesn't carry over though - the new client identifies
+		// a saved team by its own stable team.key string, so that gets its
+		// own variable instead of reusing/repurposing the old one.
+		// Likewise bmRoomFmt/bmIsBo3Format/bmRoomIsBo3/bmGetSeries/
+		// bmFormatName/downloadTxt/bmExportReplays above are pure logic with
+		// no win.app references at all, so they're called directly rather
+		// than duplicated.
+		var bmTeamKey = '';
+
+		// The new client has no persistent "currently selected format/team"
+		// model field the way old client's home room does (room.curFormat/
+		// curTeamIndex) - that selection only lives in the TeamForm Preact
+		// component instance, which isn't reachable from outside. The live
+		// DOM buttons (same ones the format/team-restore feature already
+		// reads/writes) are the most direct stand-in, with this script's own
+		// localStorage cache (also already maintained by that same feature)
+		// as a fallback for the rare case the home room isn't mounted.
+		function bmReadCurrentFormatAndTeamNewClient() {
+			var home = document.getElementById('room-');
+			var formatBtn = home && home.querySelector('button[name="format"]');
+			var teamBtn = home && home.querySelector('button[name="team"]');
+			var format = (formatBtn && formatBtn.value) || localStorage.getItem('qol_last_format') || '';
+			var teamKey = (teamBtn && teamBtn.value) || localStorage.getItem('qol_last_team_key') || '';
+			return { format: format, teamKey: teamKey };
+		}
+
+		function bmIsInBattleNewClient() {
+			if (win.PS && win.PS.rooms && Object.values(win.PS.rooms).some(function (r) { return r && r.classType === 'battle' && !r._qol2EndedAt; })) return true;
+			if (bmBo3WaitUntil && Date.now() < bmBo3WaitUntil) return true;
+			return false;
+		}
+
+		function updateBattleModeWidgetVisibilityNewClient() {
+			var w = document.getElementById('qol2-bm-widget-new');
+			if (!w) return;
+			var curRoom = win.PS && win.PS.room;
+			var curIsBattle = curRoom && curRoom.classType === 'battle';
+			w.style.display = curIsBattle ? 'none' : '';
+		}
+
+		// Old client anchors this widget inside .activitymenu/.mainmenu -
+		// the new client's real equivalent is the Home room's own
+		// ".mainmenu-mini-windows" container, the exact box the News popup
+		// lives in (and still does, right alongside this one). Since this
+		// script runs ON the real page, the page's own already-loaded
+		// client2.css already knows how to style ".mini-window"/
+		// ".mini-window-header"/".readable-bg" (light/dark-aware, proper
+		// borders and corner radii) - building REAL markup with those exact
+		// classes gets that styling for free, and the container's own CSS
+		// already handles stacking multiple mini-windows via plain block
+		// flow, so there's no positioning math to duplicate here either.
+		// Falls back to the old fixed corner box only if that container
+		// genuinely can't be found (e.g. this fires before the Home room
+		// has mounted at all) so Battle Mode never ends up with no visible
+		// UI whatsoever.
+		// A distinct id (-new suffix, also on every button inside it) keeps
+		// this completely clear of old client's own #qol2-bm-widget and the
+		// unconditional MutationObserver further down this file that drives
+		// IT: that observer calls the old updateBattleModeWidgetVisibility,
+		// which reads win.app.curRoom - always undefined on the new client,
+		// which would force this widget visible even mid-battle if it ever
+		// found this one by sharing the same id.
+		function findMiniWindowsContainerNewClient() {
+			var home = document.getElementById('room-');
+			return (home && home.querySelector('.mainmenu-mini-windows')) || null;
+		}
+
+		function renderBattleModeWidgetNewClient() {
+			var w = document.getElementById('qol2-bm-widget-new');
+			if (w && !document.contains(w)) { w.parentNode && w.parentNode.removeChild(w); w = null; }
+			if (!w) { w = document.createElement('div'); w.id = 'qol2-bm-widget-new'; }
+
+			var ip = battleMode === 'paused';
+			var isBo3Widget = bmIsBo3Format(bmFormat);
+			var seriesScoreHtml = '';
+			if (isBo3Widget) {
+				var activeSeries = Object.values(bmBo3Series).filter(function (s) { return !s.done && s.gameCount > 0; });
+				if (activeSeries.length) {
+					var s = activeSeries[activeSeries.length - 1];
+					var scoreEntries = Object.entries(s.wins);
+					if (scoreEntries.length) {
+						seriesScoreHtml = '<p style="text-align:center;font-size:9pt;margin:0 0 5px;opacity:.85;">'
+							+ '<strong>Game ' + s.gameCount + '</strong>: '
+							+ scoreEntries.map(function (e) { return e[0] + ' ' + e[1]; }).join(' – ') + '</p>';
+					}
+				}
+			}
+			// Deliberately no explicit text color on any of this - it's
+			// shared between both the mini-window body (which supplies its
+			// own light/dark-aware color via .readable-bg) and the fixed
+			// fallback box below (which sets one explicit color on its own
+			// outer wrapper instead), so the exact same markup reads
+			// correctly either way purely through normal CSS inheritance.
+			var bodyHtml = '<p style="text-align:center;font-size:10pt;margin:4px 0 6px;">'
+				+ '<i class="fa fa-play-circle' + (ip ? '' : ' fa-spin') + '" style="color:' + (ip ? '#aaa' : '#5fa') + ';margin-right:5px;"></i>'
+				+ '<strong>Battle Mode</strong></p>'
+				+ '<p style="text-align:center;font-size:8pt;margin:0 0 6px;opacity:.8;">'
+				+ bmFormatName() + '<br/>'
+				// "series" doesn't pluralize in English (unlike "battle"/
+				// "battles") - old client's own widget has the same '+s'
+				// applied unconditionally, which is a pre-existing cosmetic
+				// quirk left untouched there, but there's no reason to copy
+				// it into new code being written fresh right now.
+				+ bmBattleCount + (isBo3Widget ? ' series' : ' battle' + (bmBattleCount !== 1 ? 's' : '')) + ' &nbsp;|&nbsp; ' + bmReplays.length + ' replay' + (bmReplays.length !== 1 ? 's' : '') + ' saved</p>'
+				+ seriesScoreHtml;
+			bodyHtml += '<p><button class="button" id="qol2-bm-pause-new" style="display:' + (ip ? 'none' : 'block') + ';margin:0 auto 4px;width:100%;max-width:220px;"><i class="fa fa-pause"></i> Pause</button>'
+				+ '<button class="button" id="qol2-bm-resume-new" style="display:' + (ip ? 'block' : 'none') + ';margin:0 auto 4px;width:100%;max-width:220px;"><i class="fa fa-play"></i> Resume</button></p>';
+			bodyHtml += '<p><button class="button" id="qol2-bm-end-new" style="display:block;margin:0 auto 4px;width:100%;max-width:220px;"><i class="fa fa-stop"></i> End Battle Mode</button></p>';
+			if (bmReplays.length) bodyHtml += '<p><button class="button" id="qol2-bm-export-new" style="display:block;margin:0 auto;width:100%;max-width:220px;"><i class="fa fa-download"></i> Export Replays (' + bmReplays.length + ')</button></p>';
+
+			var container = findMiniWindowsContainerNewClient();
+			if (container) {
+				w.className = 'mini-window';
+				w.removeAttribute('style');
+				w.innerHTML = '<h3 class="mini-window-header">'
+					+ '<button class="closebutton" id="qol2-bm-headerclose-new" tabindex="-1" aria-label="End Battle Mode"><i class="fa fa-times-circle"></i></button>'
+					+ 'Battle Mode</h3>'
+					+ '<div class="mini-window-contents ps-room-light mini-window-flex"><div class="readable-bg" style="padding:8px 10px;">' + bodyHtml + '</div></div>';
+				if (w.parentNode !== container) container.appendChild(w);
+			} else {
+				w.className = 'menugroup';
+				w.style.cssText = 'position:fixed;bottom:12px;right:12px;z-index:30;background:rgba(0,0,0,.75);color:#eee;max-width:270px;border-radius:3px;padding:2px;box-shadow:0 2px 8px rgba(0,0,0,.4);';
+				w.innerHTML = bodyHtml;
+				if (w.parentNode !== document.body) document.body.appendChild(w);
+			}
+			updateBattleModeWidgetVisibilityNewClient();
+			var pb = document.getElementById('qol2-bm-pause-new'), rb = document.getElementById('qol2-bm-resume-new'), eb = document.getElementById('qol2-bm-end-new'), xb = document.getElementById('qol2-bm-export-new'), hcb = document.getElementById('qol2-bm-headerclose-new');
+			if (pb) pb.addEventListener('mousedown', function (e) { e.preventDefault(); bmPauseNewClient(); });
+			if (rb) rb.addEventListener('mousedown', function (e) { e.preventDefault(); battleMode = 'active'; renderBattleModeWidgetNewClient(); bmTrySearchNewClient(); });
+			if (eb) eb.addEventListener('mousedown', function (e) { e.preventDefault(); bmEndNewClient(); });
+			if (xb) xb.addEventListener('mousedown', function (e) { e.preventDefault(); bmExportReplays(); });
+			if (hcb) hcb.addEventListener('mousedown', function (e) { e.preventDefault(); bmEndNewClient(); });
+		}
+
+		function removeBattleModeWidgetNewClient() { var w = document.getElementById('qol2-bm-widget-new'); if (w) w.parentNode.removeChild(w); }
+
+		function bmStartNewClient() {
+			if (tbMode) tbEndNewClient();
+			var cur = bmReadCurrentFormatAndTeamNewClient();
+			bmFormat = cur.format;
+			bmTeamKey = cur.teamKey;
+			battleMode = 'active'; bmReplays = []; bmBattleCount = 0; bmBo3Series = {};
+			renderBattleModeWidgetNewClient();
+			bmTrySearchNewClient();
+		}
+
+		function bmPauseNewClient() {
+			battleMode = 'paused';
+			renderBattleModeWidgetNewClient();
+			if (win.PS && win.PS.mainmenu && !bmIsInBattleNewClient()) win.PS.mainmenu.cancelSearch();
+		}
+
+		function bmEndNewClient() {
+			battleMode = 'off'; removeBattleModeWidgetNewClient();
+			if (win.PS && win.PS.mainmenu && win.PS.mainmenu.searchingFormat()) win.PS.mainmenu.cancelSearch();
+		}
+
+		function bmTrySearchNewClient() {
+			if (battleMode !== 'active') return;
+			if (!win.PS || !win.PS.mainmenu || !bmFormat) return;
+			if (win.PS.mainmenu.searchingFormat()) return;
+			if (bmIsInBattleNewClient()) return;
+			var team = bmTeamKey && win.PS.teams && win.PS.teams.byKey ? win.PS.teams.byKey[bmTeamKey] : undefined;
+			var teambuilderFormat = (win.PS.teams && win.PS.teams.teambuilderFormat) ? win.PS.teams.teambuilderFormat(bmFormat) : bmFormat;
+			if (!team && !(win.BattleFormats && win.BattleFormats[teambuilderFormat] && win.BattleFormats[teambuilderFormat].team)) {
+				// Mirrors TeamForm.submit()'s own validation, which startSearch()
+				// itself skips entirely since it's meant to be called only after
+				// that check already passed - calling it directly here bypasses
+				// that safety net, so without this Battle Mode would otherwise
+				// just keep quietly retrying the same invalid search forever.
+				bmEndNewClient();
+				win.PS.alert('Battle Mode needs a team for ' + bmFormatName() + ' - go build one in the Teambuilder, then start Battle Mode again.');
+				return;
+			}
+			win.PS.teams.loadTeam(team).then(function () {
+				win.PS.mainmenu.startSearch(bmFormat, team);
+			});
+		}
+
+		function bmAutoDownloadSeriesNewClient(series) {
+			if (!series || !series.games.length) return;
+			var now = new Date();
+			var date = now.toISOString().slice(0, 10);
+			var time = now.toTimeString().slice(0, 8).replace(/:/g, '-');
+			var fmt = bmFormatName() || 'Bo3';
+			var myName = (win.PS && win.PS.user && win.PS.user.name) || '';
+			var players = Object.keys(series.wins);
+			var opponent = players.find(function (p) { return p.toLowerCase() !== myName.toLowerCase(); }) || '';
+			var fslug = fmt.replace(/[^a-z0-9]+/gi, '-') || 'bo3';
+			var oSlug = opponent.replace(/[^a-z0-9]+/gi, '-');
+			var fname = fslug + (oSlug ? '-vs-' + oSlug : '') + '-' + date + '-' + time + '.txt';
+			var sorted = Object.entries(series.wins).sort(function (a, b) { return b[1] - a[1]; });
+			var scoreLine = sorted.map(function (e) { return e[0] + ' ' + e[1]; }).join(' - ');
+			var lines = [
+				'Bo3 Series Replays',
+				'Format: ' + fmt,
+				'Date: ' + date,
+				'Score: ' + scoreLine,
+				''
+			];
+			series.games.forEach(function (g) {
+				lines.push('Game ' + g.game + (g.winner ? ' (' + g.winner + ' wins)' : '') + ': ' + g.url);
+			});
+			lines.push('');
+			downloadTxt(fname, lines.join('\n'));
+		}
+
+		function bmFindTrackerRoomForBattleNewClient(battleRoom) {
+			if (!win.PS || !win.PS.rooms) return null;
+			var fmt = bmRoomFmt(battleRoom && battleRoom.id);
+			var candidates = Object.values(win.PS.rooms).filter(function (r) {
+				if (!r || !r.id || r === battleRoom) return false;
+				if (r.id.indexOf('game-') !== 0) return false;
+				if (fmt && bmRoomFmt(r.id) === fmt) return true;
+				if (r.id.toLowerCase().indexOf('bestof') >= 0) return true;
+				return false;
+			});
+			if (!candidates.length) return null;
+			var active = candidates.find(function (r) {
+				return !bmBo3Series[r.id] || !bmBo3Series[r.id].done;
+			});
+			return active || candidates[candidates.length - 1];
+		}
+
+		function bmFindOpenBattleRoomsForTrackerNewClient(trackerRoom) {
+			if (!win.PS || !win.PS.rooms || !trackerRoom) return [];
+			var fmt = bmRoomFmt(trackerRoom.id);
+			return Object.values(win.PS.rooms).filter(function (r) {
+				if (!r || !r.id || r === trackerRoom) return false;
+				if (r.classType !== 'battle') return false;
+				if (r.id.indexOf('game-') === 0) return false;
+				if (fmt && bmRoomFmt(r.id) === fmt) return true;
+				return r.id.toLowerCase().indexOf('bestof') >= 0;
+			});
+		}
+
+		// The DOM-button-hunting old client does in bmClickReady (plus its
+		// raw /msgroom fallback) is working around Backbone's send() not
+		// reliably scoping to a background room. The new client's send()
+		// has no such ambiguity: PSRoom.sendDirect always transmits
+		// `${this.id}|${msg}`, so a direct send already targets this exact
+		// tracker room regardless of what's currently focused.
+		function bmClickReadyNewClient(trackerRoom) {
+			if (!trackerRoom) return;
+			win.PS.focusRoom(trackerRoom.id);
+			setTimeout(function () { trackerRoom.send('/confirmready'); }, 600);
+		}
+
+		function bmRecordGameNewClient(trackerRoom, battleRoom, replayUrl) {
+			var series = bmGetSeries(trackerRoom);
+			if (!series || series.done) return;
+
+			var battleId = battleRoom && battleRoom.id;
+			var existingGame = battleId && series.games.find(function (g) { return g.battleId === battleId; });
+			if (existingGame) {
+				if (replayUrl && !existingGame.url) existingGame.url = replayUrl;
+				return;
+			}
+
+			series.gameCount++;
+
+			var winner = '';
+			if (battleRoom && battleRoom.battle) {
+				var b = battleRoom.battle;
+				var sq = b.stepQueue || [];
+				for (var qi = 0; qi < sq.length; qi++) {
+					if (sq[qi] && sq[qi].substr(0, 5) === '|win|') { winner = sq[qi].substr(5); break; }
+				}
+				if (!winner && b.p1 && b.p2) {
+					var myName = (win.PS && win.PS.user && win.PS.user.name) || '';
+					if (b.p1.name && b.p1.name !== myName) winner = b.p1.name;
+					else if (b.p2.name) winner = b.p2.name;
+				}
+			}
+			if (winner) series.wins[winner] = (series.wins[winner] || 0) + 1;
+			series.games.push({ game: series.gameCount, battleId: battleId || '', url: replayUrl || '', winner: winner || '' });
+
+			var seriesDone = Object.values(series.wins).some(function (w) { return w >= 2; });
+			if (seriesDone) {
+				series.done = true;
+				series.games.forEach(function (g) { if (g.url && bmReplays.indexOf(g.url) === -1) bmReplays.push(g.url); });
+
+				setTimeout(function () {
+					if (battleRoom) win.PS.leave(battleRoom.id);
+					bmFindOpenBattleRoomsForTrackerNewClient(trackerRoom).forEach(function (br) { win.PS.leave(br.id); });
+					if (trackerRoom) win.PS.leave(trackerRoom.id);
+					win.PS.focusRoom('');
+				}, 150);
+
+				if (battleMode === 'active' || battleMode === 'paused') {
+					bmBattleCount++;
+					renderBattleModeWidgetNewClient();
+					if (battleMode === 'active') setTimeout(function () { bmTrySearchNewClient(); }, 1500);
+				} else {
+					bmAutoDownloadSeriesNewClient(series);
+				}
+			} else {
+				setTimeout(function () {
+					if (battleRoom) win.PS.leave(battleRoom.id);
+					bmClickReadyNewClient(trackerRoom);
+				}, 200);
+			}
+		}
+
 		// ─── Teambuilder Mode ───
 		var tbMode = false, tbMunchTab = null, tbCalcTab = null, tbLastOpenedFormat = '';
 
@@ -3496,6 +5718,54 @@
 				}
 				return r;
 			};
+		}
+
+		// ─── Teambuilder Mode (new client) ───
+		// Reuses tbMode/tbMunchTab/tbCalcTab/tbLastOpenedFormat as-is - same
+		// one-client-per-page-load reasoning as Battle Mode above. MunchStats
+		// and the NCP calc are real browser tabs either way (GM_openInTab,
+		// identical regardless of client), so the only client-specific
+		// pieces are joining the in-app Teambuilder room, finding which
+		// format is currently being edited, and the away-while-active
+		// toggle.
+		function tbStartNewClient() {
+			if (battleMode !== 'off') bmEndNewClient();
+			tbMode = true;
+			tbLastOpenedFormat = '';
+			if (getQolPref('tb-away', false) && win.PS) win.PS.send('/away');
+			if (win.PS) win.PS.join('teambuilder');
+			var calcUrl = 'https://nerd-of-now.github.io/NCP-VGC-Damage-Calculator/';
+			tbCalcTab = GM_openInTab(calcUrl, { active: false, insert: true });
+			tbWatchForFormatNewClient();
+		}
+
+		// Old client's single-page Teambuilder reactively tracks whichever
+		// team its one view currently has open (tbRoom.curTeam.format). The
+		// new client opens each team as its own separate team-<key> room/
+		// panel instead, so "whichever format you're editing" becomes
+		// "whichever team-* room is currently focused" - win.PS.room is the
+		// direct equivalent of old client's app.curRoom used elsewhere in
+		// this file, and TeamRoom.team.format is set from the team's own
+		// data the moment that room is created (panel-teambuilder-team.tsx).
+		function tbWatchForFormatNewClient() {
+			if (!tbMode) return;
+			var curRoom = win.PS && win.PS.room;
+			var fmt = (curRoom && curRoom.id && curRoom.id.indexOf('team-') === 0 && curRoom.team && curRoom.team.format || '').trim();
+			if (fmt && !/^gen\d+$/.test(fmt) && fmt !== tbLastOpenedFormat) {
+				tbLastOpenedFormat = fmt;
+				try { if (tbMunchTab && tbMunchTab.close) tbMunchTab.close(); } catch (e) {}
+				tbMunchTab = GM_openInTab('https://munchstats.com/' + fmt + '/', { active: false, insert: true });
+			}
+			setTimeout(tbWatchForFormatNewClient, 500);
+		}
+
+		function tbEndNewClient() {
+			tbMode = false;
+			try { if (tbMunchTab && tbMunchTab.close) tbMunchTab.close(); } catch (e) {}
+			try { if (tbCalcTab && tbCalcTab.close) tbCalcTab.close(); } catch (e) {}
+			tbMunchTab = null; tbCalcTab = null;
+			if (getQolPref('tb-away', false) && win.PS) win.PS.send('/back');
+			if (win.PS) win.PS.focusRoom('');
 		}
 
 		// ─── Pokémon Quick-Links in Teambuilder ───
@@ -3620,6 +5890,232 @@
 			if (menu.parentNode) menu.parentNode.insertBefore(wrap, menu);
 		}
 
+		// ─── Pokémon Quick-Links, new (Preact) client ───
+		// Showdown's newer, shared per-Pokemon set editor (the same
+		// TeamEditorState/DexSearch engine Advanced Search's
+		// getLiveSearch() already detects via win.editor) renders every
+		// Pokemon's set via the same renderSet() method in two different
+		// places: the compact, multi-Pokemon roster list (each one a
+		// <div class="set-form" data-set-index> directly under
+		// .set-list, no EV/IV editor shown) and, only once you click into
+		// one specific Pokemon, a single zoomed-in <div
+		// class="team-focus-editor"> wrapping that one set-form plus its
+		// EV/IV/nature StatForm underneath. Confirmed directly in
+		// battle-team-editor.tsx (renderInnerFocus/.team-focus-editor
+		// vs. the plain .set-list rendering) - no .setmenu/curSet the way
+		// the old client's own Teambuilder room has. This mirrors
+		// injectQuickLinks above exactly (same URLs, same
+		// exportSetToShowdownText call, same button-building helper
+		// duplicated locally per this file's own convention of keeping
+		// each function self-contained), just anchored to that different
+		// container and reading the set from editor.sets[i] instead of
+		// tbRoom.curSet. Only scanning inside .team-focus-editor (below)
+		// is deliberate: the roster list shouldn't get a links row under
+		// every single team member, only the one Pokemon currently
+		// zoomed into for editing.
+		// THE REAL BUG (confirmed in teambuilder.css, reproduced in a real
+		// browser): `.set-searchresults` - the dex/ability/item/move
+		// search-results panel shown under the search box in every
+		// isSearchMode focus view - is hardcoded as
+		// `position:absolute;top:230px` (NOT relative to the actual
+		// rendered height of the tabbar+form+searchbox stacked above it).
+		// Native Showdown gets away with this because that content's
+		// natural height always comes out to ~230px on its own, so a
+		// measured/flexible top was never needed. Our quick-links row adds
+		// real height inside that SAME normal-flow content (intentionally -
+		// see injectQuickLinksNew below), which pushes the search BOX down
+		// but does nothing to this hardcoded 230px, since Showdown's CSS
+		// has no idea our row exists. The result: `.set-searchresults`
+		// (which has its own opaque background - teambuilder.css's
+		// `.searchresults, .team-focus-editor { background:... }` rule)
+		// still starts exactly where it always did and visually covers
+		// however much of the now-pushed-down search box falls below that
+		// old boundary - this is the actual mechanism behind "the search
+		// box looks hidden"/"the mon blocks it", for species/ability/item/
+		// move search alike (they all share this one panel).
+		//
+		// Showdown already has its own precedent for nudging this exact
+		// value: `top: calc(230px + var(--teameditor-mobile-height-offset,
+		// 0))`, used by its own "zoom out forms" mobile-scaling feature
+		// (battle-team-editor.tsx, updateMobileScale). We deliberately do
+		// NOT set that shared variable ourselves (it's written elsewhere,
+		// on a different/outer element, for that unrelated feature, and
+		// stomping it could fight with mobile zoom-out for anyone using
+		// both) - instead we set `.set-searchresults`'s own inline `top`
+		// directly, referencing that same variable inside our own calc()
+		// so the two adjustments still add together correctly if a user
+		// somehow has both active, while composing to plain native 230px
+		// (plus nothing) when neither does.
+		function adjustSearchResultsOffsetNew(setFormEl, extraPx) {
+			var focusEditorEl = setFormEl.closest('.team-focus-editor');
+			if (!focusEditorEl) return;
+			var resultsEl = focusEditorEl.querySelector('.set-searchresults');
+			// stats/details/import views render StatForm/DetailsForm/
+			// SetImportForm instead (confirmed in renderInnerFocus) - those
+			// sit in normal flow with no hardcoded offset of their own, so
+			// there's nothing to adjust and nothing broken for them either
+			// (matches the user never reporting those as affected).
+			if (!resultsEl) return;
+			if (extraPx > 0) {
+				resultsEl.style.top = 'calc(230px + var(--teameditor-mobile-height-offset, 0px) + ' + extraPx + 'px)';
+			} else {
+				resultsEl.style.removeProperty('top');
+			}
+		}
+
+		function injectQuickLinksNew(setFormEl, set, curTeam) {
+			var species = set.species;
+			var baseSpecies = (win.Dex && win.Dex.species) ? win.Dex.species.get(species).baseSpecies : species.split('-')[0];
+			var nameId = baseSpecies.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/-+$/, '');
+			var teamName = curTeam ? (curTeam.name || '') : '';
+			var fmt = curTeam ? (curTeam.format || '') : '';
+
+			var serebiiUrl = 'https://www.serebii.net/pokedex-champions/' + nameId + '/';
+			var munchUrl = 'https://munchstats.com/' + (fmt ? fmt + '/1760/' + encodeURIComponent(species) : '');
+			var calcUrl = 'https://nerd-of-now.github.io/NCP-VGC-Damage-Calculator/';
+			var setExport = exportSetToShowdownText(set);
+			if (teamName) setExport = '=== ' + teamName + ' ===\n' + setExport;
+
+			var natDexNum = (win.Dex && win.Dex.species) ? win.Dex.species.get(species).num : null;
+			var labmausUrl = natDexNum ? 'https://labmaus.net/pokemon/' + natDexNum : 'https://labmaus.net/';
+
+			var wrap = document.createElement('div');
+			wrap.id = 'qol2-tb-links';
+			wrap.setAttribute('data-qol2-species', species);
+			// Deliberately NOT 'setmenu setmenu-left' here (unlike
+			// injectQuickLinks above, the old-client version, where those
+			// are correct). client.css defines both classes as
+			// position:absolute;top:5px;left:5px (confirmed in
+			// client.css) - that's the right spot in the OLD client's
+			// own .setmenu-anchored layout, but in the new client's
+			// .set-form (position:relative) that same top:5px;left:5px
+			// lands directly on top of .set-nickname (itself
+			// position:absolute;top:5px;left:-5px - see teambuilder.css),
+			// which is what was making this row visually overlap/block
+			// the nickname field (confirmed by rendering the real CSS).
+			// Leaving className unset keeps this row in normal document
+			// flow, right after .set-nickname, matching the anchoring
+			// below.
+			// flex-wrap:wrap + max-width/box-sizing are defensive: with 4
+			// buttons (icon+label each) this row is wide enough that an
+			// unusually narrow effective width (small window, page zoom,
+			// mobile-ish layout) could otherwise push it past .set-form's
+			// own right edge instead of wrapping to a 2nd line - still
+			// never overlapping the table above it (normal flow, see
+			// above), but tidier than letting it run wide.
+			wrap.style.cssText = 'display:inline-flex;flex-wrap:wrap;gap:3px;margin:4px 0;max-width:100%;box-sizing:border-box;';
+
+			function makeBtn(label, faviconUrl, onClick) {
+				var b = document.createElement('button');
+				b.className = 'button';
+				b.style.cssText = 'font-size:9pt;padding:1px 6px;display:inline-flex;align-items:center;gap:4px;';
+				var img = document.createElement('img');
+				img.src = faviconUrl;
+				img.style.cssText = 'width:14px;height:14px;vertical-align:middle;image-rendering:auto;';
+				img.onerror = function () { this.style.display = 'none'; };
+				var txt = document.createTextNode(' ' + label);
+				b.appendChild(img);
+				b.appendChild(txt);
+				b.addEventListener('click', function (e) { e.stopPropagation(); onClick(); });
+				return b;
+			}
+
+			wrap.appendChild(makeBtn('Serebii', 'https://favicon.im/serebii.net', function () { GM_openInTab(serebiiUrl, { active: true, insert: true }); }));
+			wrap.appendChild(makeBtn('MunchStats', 'https://favicon.im/munchstats.com', function () { GM_openInTab(munchUrl, { active: true, insert: true }); }));
+			wrap.appendChild(makeBtn('LabMaus', 'https://favicon.im/labmaus.net', function () { GM_openInTab(labmausUrl, { active: true, insert: true }); }));
+			wrap.appendChild(makeBtn('NCP Calc+Copy', 'https://favicon.im/nimbasacitypost.com', function () {
+				var payload = encodeURIComponent(JSON.stringify({
+					set: setExport,
+					teamName: teamName,
+					species: species
+				}));
+				GM_openInTab(calcUrl + '#qol2=' + payload, { active: true, insert: true });
+			}));
+
+			// Anchored after the nickname field (the last thing rendered
+			// inside .set-form) rather than trying to sit inline with the
+			// ability/item table cells - keeps the injected row from
+			// disturbing that table's own layout.
+			var nicknameEl = setFormEl.querySelector('.set-nickname');
+			if (nicknameEl) nicknameEl.insertAdjacentElement('afterend', wrap);
+			else setFormEl.appendChild(wrap);
+		}
+
+		var _qol2TbIntervalNew = null;
+		function patchTeambuilderLinksNew() {
+			if (_qol2TbIntervalNew) return;
+			_qol2TbIntervalNew = setInterval(function () {
+				if (!win.PS || !win.PS.rooms) return; // old client - handled by patchTeambuilderLinks above
+				var room = win.PS.room;
+				if (!room || !room.id || room.id.indexOf('team-') !== 0) return;
+				var editor = room.editor;
+				if (!editor || !editor.sets) return;
+				var el = document.getElementById('room-' + room.id);
+				if (!el) return;
+				// Checked per-tick (not just once before even looking at the
+				// DOM) so turning the preference off mid-session is treated
+				// exactly like every slot suddenly having nothing to show -
+				// the same cleanup path below removes any existing row AND
+				// undoes its .set-searchresults offset, instead of leaving a
+				// stale row (and a stale push-down) sitting there until the
+				// user happens to navigate away and back.
+				var enabled = getQolPref('tbquicklinks', false);
+				var team = (enabled && typeof room.getTeam === 'function') ? room.getTeam() : null;
+				// Scoped to .team-focus-editor only - see the comment
+				// above. The roster list's own .set-form rows (outside
+				// team-focus-editor) are deliberately left untouched.
+				el.querySelectorAll('.team-focus-editor .set-form[data-set-index]').forEach(function (setFormEl) {
+					var idx = parseInt(setFormEl.getAttribute('data-set-index'), 10);
+					var set = enabled ? editor.sets[idx] : null;
+					// Defensive: querySelectorAll (not just the first match)
+					// in case more than one copy of this script ended up
+					// active at once (e.g. installed twice in the userscript
+					// manager) and each inserted its own #qol2-tb-links here -
+					// duplicate ids don't throw, they just make a plain
+					// querySelector/getElementById pick whichever is first in
+					// document order and silently ignore the rest, which
+					// would otherwise let extra copies pile up forever since
+					// neither instance's poll would ever see the other's node
+					// as "the" existing one to validate or clean up.
+					var existingAll = setFormEl.querySelectorAll('#qol2-tb-links');
+					var existing = existingAll[0] || null;
+					for (var dupeIdx = 1; dupeIdx < existingAll.length; dupeIdx++) existingAll[dupeIdx].remove();
+					if (existing) {
+						// Preact reuses this same .set-form DOM node across a
+						// focus switch (it isn't unmounted just because a
+						// different/empty slot is now focused), so a links row
+						// built for the PREVIOUS species can linger here even
+						// though it's now wrong (or the slot is now empty).
+						if (!set || !set.species || existing.getAttribute('data-qol2-species') !== set.species) {
+							existing.remove();
+							existing = null;
+						}
+					}
+					if (!existing && set && set.species) {
+						injectQuickLinksNew(setFormEl, set, team);
+						existing = setFormEl.querySelector('#qol2-tb-links');
+					}
+					// Re-applied every tick (idempotent, cheap) rather than
+					// only right after injecting a fresh row - Preact can
+					// re-render .set-searchresults with its own brand new DOM
+					// node (e.g. switching between ability/item/move search
+					// for the same Pokemon all land on a new PSSearchResults
+					// render) without touching .set-form or our row at all,
+					// which would otherwise silently drop this adjustment
+					// until something ELSE happened to re-trigger it.
+					if (existing) {
+						var wrapCs = getComputedStyle(existing);
+						var extraPx = existing.getBoundingClientRect().height +
+							(parseFloat(wrapCs.marginTop) || 0) + (parseFloat(wrapCs.marginBottom) || 0);
+						adjustSearchResultsOffsetNew(setFormEl, extraPx);
+					} else {
+						adjustSearchResultsOffsetNew(setFormEl, 0);
+					}
+				});
+			}, 300);
+		}
+		patchTeambuilderLinksNew();
+
 		(function hookFocusRoom() {
 			if (!win.app || !app.focusRoom) { setTimeout(hookFocusRoom, 300); return; }
 			if (app._qol2FocusHooked) return;
@@ -3651,7 +6147,17 @@
 		}).observe(document.body, { childList: true, subtree: true });
 
 		// ─── Auto-join VGC ───
-		(function tryAutoJoin() { if (!win.app || !app.user || !app.user.get('named')) { setTimeout(tryAutoJoin, 500); return; } if (!app.rooms['vgc']) app.tryJoinRoom('vgc'); })();
+		(function tryAutoJoin() {
+			if (win.app) {
+				if (!app.user || !app.user.get('named')) { setTimeout(tryAutoJoin, 500); return; }
+				if (!app.rooms['vgc']) app.tryJoinRoom('vgc');
+			} else if (win.PS) {
+				if (!win.PS.user || !win.PS.user.named) { setTimeout(tryAutoJoin, 500); return; }
+				if (!win.PS.rooms['vgc']) win.PS.join('vgc');
+			} else {
+				setTimeout(tryAutoJoin, 500);
+			}
+		})();
 
 		// ─── Save Tab Order ───
 		var TAB_ORDER_KEY = 'qol2-tab-order';
@@ -3671,6 +6177,62 @@
 			app.topbar.dragEndRoom = function (e) { orig(e); saveTabOrder(); };
 			restoreTabOrder();
 		}
+
+		// ─── Save Tab Order (new client) ───
+		// New client has no dedicated drag-end hook like old client's
+		// topbar.dragEndRoom - instead every reorder (drag-and-drop or
+		// otherwise) funnels through the single PS.dragOnto(room,
+		// location, index) method, so patching that one spot covers
+		// drags to either side of the tabbar. leftRoomList[0] is
+		// always the home room and can never be dragged (PS.dragOnto
+		// itself refuses to move it), so it's kept pinned rather than
+		// sorted along with the rest.
+		var TAB_ORDER_KEY_NEW = 'qol2-tab-order-new';
+		function saveTabOrderNewClient() {
+			if (!win.PS) return;
+			var order = ([]).concat(win.PS.leftRoomList || [], win.PS.rightRoomList || []);
+			localStorage.setItem(TAB_ORDER_KEY_NEW, JSON.stringify(order));
+		}
+		function restoreTabOrderNewClient() {
+			if (!win.PS) return;
+			try {
+				var saved = JSON.parse(localStorage.getItem(TAB_ORDER_KEY_NEW) || '[]');
+				if (!saved.length) return;
+				var sortFn = function (a, b) {
+					var ai = saved.indexOf(a), bi = saved.indexOf(b);
+					if (ai === -1) return 1;
+					if (bi === -1) return -1;
+					return ai - bi;
+				};
+				if (win.PS.leftRoomList && win.PS.leftRoomList.length > 1) {
+					var home = win.PS.leftRoomList[0];
+					var restL = win.PS.leftRoomList.slice(1).sort(sortFn);
+					win.PS.leftRoomList.length = 0;
+					win.PS.leftRoomList.push(home);
+					for (var i = 0; i < restL.length; i++) win.PS.leftRoomList.push(restL[i]);
+				}
+				if (win.PS.rightRoomList) win.PS.rightRoomList.sort(sortFn);
+				win.PS.update();
+			} catch (e) {}
+		}
+		function patchTabOrderNewClient() {
+			if (!win.PS || typeof win.PS.dragOnto !== 'function' || win.PS._qol2DragPatched) return;
+			win.PS._qol2DragPatched = true;
+			var orig = win.PS.dragOnto.bind(win.PS);
+			win.PS.dragOnto = function () {
+				var result = orig.apply(this, arguments);
+				saveTabOrderNewClient();
+				return result;
+			};
+		}
+		(function tryPatchTabOrderNewClient() {
+			if (win.PS && typeof win.PS.dragOnto === 'function') {
+				patchTabOrderNewClient();
+				setTimeout(restoreTabOrderNewClient, 3000);
+			} else {
+				setTimeout(tryPatchTabOrderNewClient, 300);
+			}
+		})();
 
 		// ─── Search Timer ───
 		var SEARCH_TIMEOUT = 60, searchTimerInterval = null, searchTimerSeconds = 0;
@@ -3703,6 +6265,64 @@
 			};
 		}
 
+		// ─── Search Timer (new client) ───
+		// PS.mainmenu.searchCountdown is a *different* native 3-second
+		// "about to send your search" countdown, not this feature (the
+		// "give up after 60s of no match" cancel timer) - so this only
+		// starts once that's finished and searchingFormat() is still
+		// true (meaning the /search was actually sent and we're now
+		// genuinely waiting on the server).
+		var SEARCH_TIMEOUT_NEW = 60, searchTimerIntervalNew = null, searchTimerSecondsNew = 0;
+		function stopSearchTimerNew() {
+			if (searchTimerIntervalNew) { clearInterval(searchTimerIntervalNew); searchTimerIntervalNew = null; }
+			var el = document.getElementById('qol2-search-timer-new');
+			if (el && el.parentNode) el.parentNode.removeChild(el);
+		}
+		function findSearchTimerAnchorNew() {
+			var home = document.getElementById('room-');
+			if (!home) return null;
+			return home.querySelector('.mainmenu1.mainmenu.big.button[disabled]');
+		}
+		function startSearchTimerNew() {
+			stopSearchTimerNew();
+			searchTimerSecondsNew = SEARCH_TIMEOUT_NEW;
+			var anchor = findSearchTimerAnchorNew();
+			if (!anchor || !anchor.parentNode) return;
+			var p = document.createElement('p');
+			p.id = 'qol2-search-timer-new';
+			anchor.parentNode.insertBefore(p, anchor.nextSibling);
+			function tick() {
+				var el = document.getElementById('qol2-search-timer-new');
+				var stillSearching = win.PS && win.PS.mainmenu && win.PS.mainmenu.searchingFormat() && !win.PS.mainmenu.searchCountdown;
+				if (!el || !stillSearching) { stopSearchTimerNew(); return; }
+				searchTimerSecondsNew--;
+				if (searchTimerSecondsNew <= 0) {
+					stopSearchTimerNew();
+					win.PS.mainmenu.cancelSearch();
+					win.PS.update();
+					return;
+				}
+				var pct = (searchTimerSecondsNew / SEARCH_TIMEOUT_NEW) * 100;
+				var color = pct > 50 ? '#fff' : pct > 25 ? '#f8c000' : '#ff6060';
+				el.innerHTML = '<small style="color:' + color + ';">Cancelling in ' + searchTimerSecondsNew + 's</small>';
+			}
+			tick();
+			searchTimerIntervalNew = setInterval(tick, 1000);
+		}
+		function watchSearchTimerNew() {
+			if (win._qol2SearchTimerWatching) return;
+			win._qol2SearchTimerWatching = true;
+			var was = false;
+			setInterval(function () {
+				if (!win.PS || !win.PS.mainmenu) return;
+				var is = !!(win.PS.mainmenu.searchingFormat() && !win.PS.mainmenu.searchCountdown);
+				if (!was && is) startSearchTimerNew();
+				else if (was && !is) stopSearchTimerNew();
+				was = is;
+			}, 300);
+		}
+		watchSearchTimerNew();
+
 		// ─── Away Mode ───
 		function patchUserbar() {
 			if (!win.UserPopup || UserPopup.prototype._qol2AwayHooked) return;
@@ -3724,6 +6344,51 @@
 				if ($hr.length) $hr.before($(' '), $a, $(' '), $b);
 			};
 		}
+
+		// ─── Away Mode (new client) ───
+		// The new client's own-profile popup (UserPanel) has no Away/Back
+		// toggle at all - just a free-text status editor (StatusEditor) - so
+		// unlike the old client's version above, there's no existing
+		// live-highlighted state to extend. Deliberately not trying to mirror
+		// that live highlighting here: it depends on PS.mainmenu's
+		// userdetailsCache, which is populated asynchronously (a /cmd
+		// userdetails query fired from UserRoom's own constructor) and can
+		// be stale or briefly empty right when this panel first mounts.
+		// Plain, unstyled action buttons avoid that timing fragility
+		// entirely while still doing the one thing that matters: sending
+		// /away or /back.
+		function injectAwayBackNewClient(panel) {
+			var root = panel.base;
+			if (!root) return;
+			var room = panel.props && panel.props.room;
+			if (!room || !room.userid || !win.PS.user || room.userid !== win.PS.user.userid) return;
+			if (root.querySelector('.qol2-awayback')) return;
+			var details = root.querySelector('.userdetails');
+			if (!details) return;
+			details.insertAdjacentHTML('afterend', '<p class="buttonbar qol2-awayback">' +
+				'<button class="button" data-cmd="/away"><i class="fa fa-moon-o"></i> Away</button> ' +
+				'<button class="button" data-cmd="/back"><i class="fa fa-sun-o"></i> Back</button>' +
+				'</p>');
+		}
+		function patchUserPanelNewClient() {
+			var RoomType = win.PS && win.PS.roomTypes && win.PS.roomTypes['user'];
+			if (!RoomType || RoomType.prototype._qol2AwayPatched) return;
+			RoomType.prototype._qol2AwayPatched = true;
+			var origMount = RoomType.prototype.componentDidMount;
+			var origUpdate = RoomType.prototype.componentDidUpdate;
+			RoomType.prototype.componentDidMount = function () {
+				if (origMount) origMount.call(this);
+				injectAwayBackNewClient(this);
+			};
+			RoomType.prototype.componentDidUpdate = function () {
+				if (origUpdate) origUpdate.call(this);
+				injectAwayBackNewClient(this);
+			};
+		}
+		(function tryPatchUserPanelNewClient() {
+			if (win.PS && win.PS.roomTypes && win.PS.roomTypes['user']) patchUserPanelNewClient();
+			else setTimeout(tryPatchUserPanelNewClient, 300);
+		})();
 
 		// ─── Forfeit close ───
 		function patchForfeitPopup() {
@@ -3937,6 +6602,258 @@
 			};
 		}
 
+		// ─── OTS / forfeit-close / auto-replay (new client) ───
+		// Unlike the old client (which intercepts room.add(rawString) and
+		// scans the raw text), the new client hands BattleRoom.handleLine(args)
+		// pre-parsed protocol lines, so there's no text to scan - just
+		// args[0] to switch on. Three old-client features converge on this
+		// one override because all three keys (OTS offer, forfeit detection,
+		// battle-end) are protocol lines seen here first:
+		//  - args[0]==='uhtml' carrying the open-team-sheets prompt (server
+		//    source: data/rulesets.ts, box name "otsrequest", buttons whose
+		//    value attributes literally contain "acceptopenteamsheets" /
+		//    "openteamsheet" - same substring check as old client, just
+		//    against args[2] instead of the raw line).
+		//  - args[0]==='win'/'tie' is both "the battle ended" (to auto-fire
+		//    /savereplay, mirroring hookBattleEndReplay's needSave logic
+		//    above) and "maybe time to auto-close" (if this client just sent
+		//    /forfeit itself - see the send() patch below - or if
+		//    auto-closing after a copied replay is desired; the actual close
+		//    for the replay case happens from the PS.alert patch instead,
+		//    once the replay URL is known).
+		// Mutating args[2] in place for the uhtml case is safe and sufficient:
+		// receiveBatch builds the chat-log line via '|' + args.join('|') AFTER
+		// handleLine returns, using this same args array reference, so the
+		// edited HTML flows through to battle-log.ts's changeUhtml() exactly
+		// like the pre-edited original.
+		function patchBattleRoomProtocolNewClient() {
+			var RoomType = win.PS && win.PS.roomTypes && win.PS.roomTypes['battle'];
+			var BattleRoomModel = RoomType && RoomType.Model;
+			if (!BattleRoomModel || BattleRoomModel.prototype._qol2ProtocolPatched) return;
+			BattleRoomModel.prototype._qol2ProtocolPatched = true;
+
+			// Self-forfeit detection has to happen at the point this client
+			// sends the command, not by scanning incoming "X forfeited."
+			// chat text - that message is broadcast to BOTH players, and
+			// closeforfeit (mirroring old client's ForfeitPopup checkbox) is
+			// only ever about auto-closing YOUR OWN room after YOU forfeit,
+			// never the opponent's. Every forfeit path (the "[Forfeit]" and
+			// "[Forfeit and close]" buttons' /inopener /forfeit, as well as
+			// typing /forfeit manually) ends up calling room.send() directly
+			// on this exact battle room instance.
+			var origSend = BattleRoomModel.prototype.send;
+			BattleRoomModel.prototype.send = function (text) {
+				if (typeof text === 'string' && /^\/forfeit(\s|$)/.test(text)) {
+					this._qol2SelfForfeited = true;
+				}
+				return origSend.apply(this, arguments);
+			};
+
+			var origHandleLine = BattleRoomModel.prototype.handleLine;
+			BattleRoomModel.prototype.handleLine = function (args) {
+				if (args[0] === 'uhtml' && typeof args[2] === 'string') {
+					var lower = args[2].toLowerCase();
+					if (lower.indexOf('openteamsheet') >= 0 && lower.indexOf('acceptopenteamsheets') >= 0) {
+						var ots = getQolPref('ots', 'ask');
+						if (ots === 'accept') {
+							this.send('/acceptopenteamsheets');
+							args[2] = args[2].replace(/<button[\s\S]*?<\/button>/gi, '<em style="color:#888">(auto-accepted open team sheets)</em>');
+						} else if (ots === 'reject') {
+							this.send('/rejectopenteamsheets');
+							args[2] = args[2].replace(/<button[\s\S]*?<\/button>/gi, '<em style="color:#888">(auto-rejected open team sheets)</em>');
+						}
+					}
+				} else if (args[0] === 'win' || args[0] === 'tie') {
+					if (!this._qol2EndedAt) this._qol2EndedAt = Date.now();
+					var self = this;
+					// game-* tracker rooms share this exact class (BattlePanel's
+					// routes cover both 'battle-*' and 'game-*'), but they aren't
+					// real battles - no replay of their own to save, no forfeit
+					// of their own to close for. Their own win/tie is handled
+					// separately below, as a backup series-end signal only.
+					var isTrackerRoomNew = this.id && this.id.indexOf('game-') === 0;
+
+					if (!isTrackerRoomNew) {
+						var needSaveNew = getQolPref('autocopyreplay', false) || getQolPref('autoclosebattle', false)
+							|| battleMode === 'active' || battleMode === 'paused' || bmRoomIsBo3(this);
+						if (needSaveNew && !this._qol2ReplaySentNew) {
+							this._qol2ReplaySentNew = true;
+							setTimeout(function () { self.send('/savereplay'); }, 2000);
+						}
+						if (this._qol2SelfForfeited && getQolPref('closeforfeit', true) && !this._qol2ForfeitCloseScheduled) {
+							this._qol2ForfeitCloseScheduled = true;
+							var roomid = this.id;
+							setTimeout(function () {
+								win.PS.leave(roomid);
+								win.PS.focusRoom('');
+							}, 500);
+						}
+						// Battle Mode bookkeeping, mirroring hookBattleModeRoom:
+						// a plain battle increments the count and re-triggers the
+						// search loop directly; a Bo3 game instead opens a short
+						// "still kind of in battle" window, since the real
+						// per-series accounting (and the eventual re-search) is
+						// driven by bmRecordGame via the replay-URL/PS.alert path
+						// once the actual series result is known.
+						if ((battleMode === 'active' || battleMode === 'paused') && !this._qol2BmEndFired) {
+							this._qol2BmEndFired = true;
+							if (bmRoomIsBo3(this)) {
+								bmBo3WaitUntil = Date.now() + 5000;
+								setTimeout(function () { bmBo3WaitUntil = 0; }, 5000);
+							} else {
+								bmBattleCount++;
+								renderBattleModeWidgetNewClient();
+								if (battleMode === 'active') setTimeout(function () { bmTrySearchNewClient(); }, 1500);
+							}
+						}
+					} else if (!this._qol2SeriesEndCheckScheduled) {
+						// Backup path only: the normal per-game route (bmRecordGame,
+						// triggered per game as each replay URL becomes available)
+						// already marks the series done once someone reaches 2 wins.
+						// This only ever does anything when the series ended some
+						// OTHER way - forfeit or inactivity between games - with no
+						// winning game's own win/tie to drive that path. The delay
+						// gives that normal path a chance to finish first so this
+						// doesn't double-handle a series that's already wrapping up.
+						this._qol2SeriesEndCheckScheduled = true;
+						setTimeout(function () {
+							var series = bmGetSeries(self);
+							if (series && !series.done) {
+								series.done = true;
+								series.games.forEach(function (g) { if (g.url && bmReplays.indexOf(g.url) === -1) bmReplays.push(g.url); });
+								bmFindOpenBattleRoomsForTrackerNewClient(self).forEach(function (br) { win.PS.leave(br.id); });
+								setTimeout(function () {
+									win.PS.leave(self.id);
+									win.PS.focusRoom('');
+								}, 150);
+								if (battleMode === 'active' || battleMode === 'paused') {
+									bmBattleCount++;
+									renderBattleModeWidgetNewClient();
+									if (battleMode === 'active') setTimeout(function () { bmTrySearchNewClient(); }, 1500);
+								} else {
+									bmAutoDownloadSeriesNewClient(series);
+								}
+							}
+						}, 3000);
+					}
+				}
+				return origHandleLine.call(this, args);
+			};
+		}
+		(function tryPatchBattleRoomProtocolNewClient() {
+			var RoomType = win.PS && win.PS.roomTypes && win.PS.roomTypes['battle'];
+			if (RoomType && RoomType.Model) patchBattleRoomProtocolNewClient();
+			else setTimeout(tryPatchBattleRoomProtocolNewClient, 300);
+		})();
+
+		// Replay-link popups arrive for the new client exactly like every
+		// other server |popup| message (routed through PS.alert - see
+		// panel-mainmenu.tsx's case 'popup') since, unlike the old client,
+		// there's no separate client-side upload/response path to hook: new
+		// client never does a client-side replay upload at all, it just
+		// waits for the server's popup response to /savereplay. That makes
+		// PS.alert the single correct interception point for both
+		// auto-copying the URL and (if enabled) silently closing the battle
+		// instead of ever showing the popup - mirroring old client's own
+		// app.addPopup/app.closePopup pairing one level up the stack.
+		function findBattleRoomForReplayUrlNewClient(url) {
+			if (!win.PS || !win.PS.rooms) return null;
+			var rid = url.replace(/^https?:\/\/[^/]+\//, '');
+			var candidates = Object.values(win.PS.rooms).filter(function (r) { return r && r.classType === 'battle'; });
+			var room = candidates.find(function (r) { return r.id && r.id.indexOf(rid) >= 0; });
+			if (!room) {
+				room = candidates
+					.filter(function (r) { return r._qol2EndedAt; })
+					.sort(function (a, b) { return (b._qol2EndedAt || 0) - (a._qol2EndedAt || 0); })[0];
+			}
+			if (!room) room = candidates[0];
+			return room || null;
+		}
+		function patchAlertNewClient() {
+			if (!win.PS || typeof win.PS.alert !== 'function' || win.PS._qol2AlertPatched) return;
+			win.PS._qol2AlertPatched = true;
+			var origAlert = win.PS.alert.bind(win.PS);
+			win.PS.alert = function (message, opts) {
+				var m = typeof message === 'string' && message.match(/(https?:\/\/replay\.pokemonshowdown\.com\/[\w-]+)/);
+				var url = m && m[1];
+				if (url) {
+					var isBo3New = bmIsBo3Format(bmFormat) || url.toLowerCase().indexOf('bo3') >= 0;
+					var battleRoomForUrl = findBattleRoomForReplayUrlNewClient(url);
+
+					// Battle Mode (active or paused): always copies, always
+					// suppresses the popup, and either feeds a Bo3 series or
+					// moves straight to the next search - mirrors old client's
+					// patchUploadReplay exactly, including copying even when the
+					// autocopyreplay toggle is off (Battle Mode's own replay
+					// export is the point, not that per-battle setting).
+					if (battleMode === 'active' || battleMode === 'paused') {
+						copyToClipboard(url);
+						if (isBo3New) {
+							bmBo3WaitUntil = 0;
+							bmRecordGameNewClient(bmFindTrackerRoomForBattleNewClient(battleRoomForUrl), battleRoomForUrl, url);
+						} else {
+							if (bmReplays.indexOf(url) === -1) bmReplays.push(url);
+							renderBattleModeWidgetNewClient();
+							if (battleRoomForUrl) win.PS.leave(battleRoomForUrl.id);
+							win.PS.focusRoom('');
+							setTimeout(function () { if (battleMode === 'active') bmTrySearchNewClient(); }, 1500);
+						}
+						return;
+					}
+
+					// Bo3 outside Battle Mode: still bundles the series into one
+					// tracked set of replays instead of 2-3 separate popups,
+					// same as old client (a Bo3 match can happen from normal
+					// matchmaking too, not just inside Battle Mode).
+					if (isBo3New) {
+						if (getQolPref('autocopyreplay', false)) copyToClipboard(url);
+						bmRecordGameNewClient(bmFindTrackerRoomForBattleNewClient(battleRoomForUrl), battleRoomForUrl, url);
+						return;
+					}
+
+					var doCopy = getQolPref('autocopyreplay', false);
+					var doClose = getQolPref('autoclosebattle', false);
+					if (doCopy) copyToClipboard(url);
+					if (doClose) {
+						if (battleRoomForUrl) {
+							var roomid = battleRoomForUrl.id;
+							setTimeout(function () {
+								win.PS.leave(roomid);
+								win.PS.focusRoom('');
+							}, 2000);
+						}
+						return; // mirrors old client's app.closePopup(): never shown
+					}
+				}
+				return origAlert(message, opts);
+			};
+		}
+		(function tryPatchAlertNewClient() {
+			if (win.PS && typeof win.PS.alert === 'function') patchAlertNewClient();
+			else setTimeout(tryPatchAlertNewClient, 300);
+		})();
+
+		// Keeps the Battle Mode widget (if any) hidden while actually
+		// looking at a battle, mirroring old client's hookFocusRoom. Scoped
+		// to win.PS._qol2FocusPatched (an own property on this specific
+		// singleton) rather than a prototype flag, since PS.focusRoom is a
+		// plain instance method, not shared across multiple rooms the way
+		// BattleRoom.prototype.send/handleLine are above.
+		(function tryPatchFocusRoomNewClient() {
+			if (!win.PS || typeof win.PS.focusRoom !== 'function') { setTimeout(tryPatchFocusRoomNewClient, 300); return; }
+			if (win.PS._qol2FocusPatched) return;
+			win.PS._qol2FocusPatched = true;
+			var origFocusRoom = win.PS.focusRoom.bind(win.PS);
+			win.PS.focusRoom = function () {
+				var r = origFocusRoom.apply(this, arguments);
+				if (battleMode !== 'off') setTimeout(updateBattleModeWidgetVisibilityNewClient, 50);
+				return r;
+			};
+		})();
+		// Backup for any visibility-relevant DOM change focusRoom() doesn't
+		// itself trigger, same defensive pairing old client uses.
+		new MutationObserver(function () { if (battleMode !== 'off') updateBattleModeWidgetVisibilityNewClient(); }).observe(document.body, { childList: true, subtree: false });
+
 		// ─── Ladder Stats (F key) ───
 		function escHtml(s) { return win.BattleLog ? BattleLog.escapeHTML(String(s)) : String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
 		function closeStatsWidget() { var w = document.getElementById('qol2-stats-widget'); if (w) w.parentNode.removeChild(w); }
@@ -3954,10 +6871,25 @@
 		}
 		function showStatsWidget() {
 			if (document.getElementById('qol2-stats-widget')) { closeStatsWidget(); return; }
-			var fid = ((win.app && win.app.rooms && app.rooms['']) ? app.rooms[''].curFormat : null) || (document.querySelector('button[name=format]') || {}).value;
-			if (!fid) return;
-			var uid = win.app && win.app.user && app.user.get('userid'); if (!uid) return;
-			var fn = (win.BattleFormats && BattleFormats[fid]) ? BattleFormats[fid].name : fid;
+			var rawFid = ((win.app && win.app.rooms && app.rooms['']) ? app.rooms[''].curFormat : null) || (document.querySelector('button[name=format]') || {}).value;
+			if (!rawFid) return;
+			// New client's button[name="format"].value is the format's pretty
+			// display name ("[Gen 9 Champions] VGC 2026 Reg M-C"), not its
+			// clean BattleFormats-keyed id ("gen9championsvgc2026regmc") -
+			// the same FormatDropdownPanel quirk the format/team persistence
+			// restore elsewhere in this script already normalizes for via
+			// toID()-style lowercase+strip. Old client's room.curFormat is
+			// already a clean id, and that normalization is a no-op on an
+			// already-clean id, so it's applied unconditionally rather than
+			// branching on which client this came from. Without it, the
+			// BattleFormats lookup below silently falls back to the raw
+			// (already-pretty) string for display - so the popup's title
+			// still looks completely correct - while the ratings lookup has
+			// no such fallback and just as silently renders "No data for
+			// this format" even when real ladder data exists.
+			var fid = String(rawFid).toLowerCase().replace(/[^a-z0-9]+/g, '');
+			var uid = (win.app && win.app.user && app.user.get('userid')) || (win.PS && win.PS.user && win.PS.user.userid); if (!uid) return;
+			var fn = (win.BattleFormats && BattleFormats[fid]) ? BattleFormats[fid].name : rawFid;
 			renderStatsWidget(fid, fn, undefined);
 			var ul = document.querySelector('#qol2-stats-widget .popupmenu');
 			if (ul) { var li = document.createElement('li'); li.style.cssText = 'color:#888;font-style:italic;padding:2px 0;'; li.textContent = 'Loading...'; ul.appendChild(li); }
@@ -4030,15 +6962,29 @@
 	})();
 
 	// ============================================================
-	// OTS POKEPASTE MODIFIER
+	// OTS POKEPASTE MODIFIER (+ PokePaste export, new client)
 	// ============================================================
-	// Changes what "Upload to PokePaste (Open Team Sheet)"
-	// uploads: reverts any Mega Pokemon to its base forme (still holding
-	// the mega stone) with ability-correction, omits Shiny status, and
-	// optionally includes Nature (toggle lives in Options -> Teambuilder,
-	// "Include Nature in OTS Pokepaste export" - some tournaments still use
-	// the older no-nature teamsheet convention, so this defaults to on but
-	// is easy to turn off).
+	// Old client natively renders "Upload to PokePaste" / "Upload to
+	// PokePaste (Open Team Sheet)" buttons (oldclient/client-teambuilder.js,
+	// Teambuilder.pokepasteExport) inside the Import/Export tab. This
+	// section changes what the OTS (Open Team Sheet) variant actually
+	// uploads on EITHER client: reverts any Mega Pokemon to its base
+	// forme (still holding the mega stone) with ability-correction, omits
+	// Shiny status, and optionally includes Nature (toggle lives in
+	// Options -> Teambuilder, "Include Nature in OTS Pokepaste export" -
+	// some tournaments still use the older no-nature teamsheet
+	// convention, so this defaults to on but is easy to turn off).
+	//
+	// The new (Preact) client has NO pokepaste buttons of any kind in its
+	// own Import/Export tab (battle-team-editor.tsx's TeamTextbox renders
+	// just a lone [Copy] button) - confirmed it only ever uses pokepaste
+	// URLs for IMPORTING a team, never for exporting one. The new-client
+	// section below (after the old-client patch) ports both buttons over,
+	// reusing buildOTSExportText()/otsIncludeNature() as-is: editor.sets
+	// there is built from the same shared Teams.PokemonSet shape
+	// (species/ability/item/moves/nature/evs/ivs/etc, confirmed directly
+	// from battle-teams.ts) that old client's curSetList uses, so the
+	// exact same OTS transformation logic applies unmodified.
 	(function () {
 		var OTS_PREFS_KEY = 'qol2-settings';
 		function otsIncludeNature() {
@@ -4182,6 +7128,112 @@
 
 		setInterval(tryPatch, 500);
 		new MutationObserver(tryPatch).observe(document.body, { childList: true, subtree: true });
+
+		// ─── PokePaste export (new client) ───
+		// No old-client form to borrow (it only exists at all once/if the
+		// old-client Teambuilder room has actually been constructed this
+		// session), so this builds its own equivalent hidden form rather
+		// than depending on oldclient/client-teambuilder.js's
+		// #pokepasteForm existing in the DOM.
+		var pokepasteFormNew = null;
+		function qolPokepasteFormNew() {
+			if (pokepasteFormNew && document.body.contains(pokepasteFormNew)) return pokepasteFormNew;
+			var form = document.createElement('form');
+			form.id = 'qol2-pokepaste-form-new';
+			form.method = 'post';
+			form.action = 'https://pokepast.es/create';
+			form.target = '_blank';
+			form.style.display = 'none';
+			['title', 'paste', 'author', 'notes'].forEach(function (field) {
+				var input = document.createElement('input');
+				input.type = 'hidden';
+				input.name = field;
+				input.id = 'qol2-paste-' + field + '-new';
+				form.appendChild(input);
+			});
+			document.body.appendChild(form);
+			pokepasteFormNew = form;
+			return form;
+		}
+
+		function submitPokepasteNew(team, text, isOTS) {
+			if (!text || !text.trim()) {
+				if (win.PS && win.PS.alert) win.PS.alert('Add a Pokémon to your team before uploading it!');
+				return;
+			}
+			var form = qolPokepasteFormNew();
+			document.getElementById('qol2-paste-title-new').value = (team && team.name ? team.name : 'Team') + (isOTS ? ' (OTS)' : '');
+			document.getElementById('qol2-paste-paste-new').value = text;
+			document.getElementById('qol2-paste-author-new').value = (win.PS && win.PS.user && win.PS.user.name) || '';
+			// Mirrors the old client's own condition exactly: 'gen9' bare is
+			// the no-specific-format placeholder, not a real tier, so it's
+			// not worth a notes line.
+			document.getElementById('qol2-paste-notes-new').value = (team && team.format && team.format !== 'gen9') ? ('Format: ' + team.format) : '';
+			form.submit();
+		}
+
+		// Anchored to .teameditor-text's previous sibling <p> (confirmed
+		// directly from battle-team-editor.tsx's TeamTextbox.render(): the
+		// lone [Copy] button's <p> is always immediately followed by
+		// <div class="teameditor-text"><textarea class="teamtextbox">...)
+		// rather than any class on the [Copy] button itself, which is just
+		// a bare "button" - far too generic to match on safely. Presence
+		// of .teameditor-text also doubles as "the Import/Export sub-tab
+		// is the one currently showing" (TeamTextbox only mounts when it
+		// is), so nothing extra is needed to detect that.
+		function injectPokepasteButtonsNewClient() {
+			if (!win.PS || !win.PS.room) return;
+			var room = win.PS.room;
+			if (!room.id || room.id.indexOf('team-') !== 0) return;
+			var editor = room.editor;
+			if (!editor || !editor.sets) return;
+			var roomEl = document.getElementById('room-' + room.id);
+			if (!roomEl) return;
+			var teamEditorText = roomEl.querySelector('.teameditor-text');
+			if (!teamEditorText) return;
+			var p = teamEditorText.previousElementSibling;
+			if (!p || p.tagName !== 'P' || p.querySelector('.qol2-pokepaste-btn-new')) return;
+
+			var team = (typeof room.getTeam === 'function') ? room.getTeam() : room.team;
+			// Open Team Sheets are a VGC-specific convention - matches the
+			// old client's own .includes('vgc') gate exactly. team.format
+			// is already toID-normalized (lowercase/alphanumeric-only) by
+			// the time it reaches here (confirmed from client-main.ts's
+			// TeamRoom.setFormat), so a plain substring check is enough.
+			var isVgc = !!(team && team.format && team.format.indexOf('vgc') !== -1);
+
+			function makeBtn(label) {
+				var b = document.createElement('button');
+				b.type = 'button';
+				b.className = 'button qol2-pokepaste-btn-new';
+				b.style.marginLeft = '4px';
+				b.innerHTML = '<i class="fa fa-upload" aria-hidden="true"></i> ' + label;
+				return b;
+			}
+
+			var plainBtn = makeBtn('Upload to PokePaste');
+			plainBtn.addEventListener('click', function () {
+				// Reads the textarea's live DOM value directly, same as the
+				// native [Copy] button (copyAll) does - whatever's on screen,
+				// including any in-progress manual edits, is exactly what
+				// gets uploaded.
+				var textarea = teamEditorText.querySelector('.teamtextbox');
+				submitPokepasteNew(team, textarea ? textarea.value : '', false);
+			});
+			p.appendChild(plainBtn);
+
+			if (isVgc) {
+				var otsBtn = makeBtn('Upload to PokePaste (Open Team Sheet)');
+				otsBtn.addEventListener('click', function () {
+					// editor.sets is read live at click time (not cached at
+					// injection time) so it reflects any edits made since -
+					// see submitPokepasteNew's caller comment above.
+					submitPokepasteNew(team, buildOTSExportText(editor.sets), true);
+				});
+				p.appendChild(otsBtn);
+			}
+		}
+		setInterval(injectPokepasteButtonsNewClient, 300);
 	})();
 
 	// ============================================================
@@ -4372,5 +7424,67 @@
   }
 `);
 
-	console.log('[Showdown Suite] v1.2.0 (build: pin-fix-debug3) loaded - Music, QoL, Move to Folder, Battle Update, OTS Pokepaste Modifier, Text Size, Rainbow Buttons.');
+	// ─── Close buttons for popups that don't have one ───
+	// Confirmed directly against the real new-client source
+	// (panel-popups.tsx): every 'popup'-location room is rendered by the
+	// generic PSPanelWrapper as a bare <div class="ps-popup"
+	// id="room-<roomid>">, with no close control of its own - closing is
+	// normally click-outside or Escape only. Neither UserPanel (routes
+	// 'user-*' / 'viewuser-*' / 'users' - this is what renders your own
+	// name popup, someone else's, and the online-users list, since they're
+	// all the same component) nor VolumePanel (route 'volume') render a
+	// close button in their own markup, confirmed by reading both render()
+	// methods - that's not a client bug, it's just genuinely missing.
+	// .closebutton itself carries no position/placement CSS of its own
+	// (confirmed in client2.css - every native use of it relies on
+	// surrounding flex/tab layout for placement, which these two popups'
+	// content doesn't have), so this positions its own copy with absolute
+	// coordinates against .ps-popup instead, which is already
+	// position:absolute itself - simpler and less invasive than restyling
+	// either popup's internal layout to add a flex header row.
+	(function () {
+		function isTargetPopup(el) {
+			if (!el || !el.classList || !el.classList.contains('ps-popup')) return false;
+			var id = el.id || '';
+			// "user-"/"viewuser-" (not "useroptions-", the separate "..."
+			// menu popup - that one's a different component, out of scope
+			// here) and the exact "users" (online-users list) id.
+			return id === 'room-volume' || id === 'room-users' || /^room-(user|viewuser)-/.test(id);
+		}
+		function addCloseButton(el) {
+			if (el.querySelector(':scope > .qol2-popup-close')) return;
+			var btn = document.createElement('button');
+			btn.className = 'closebutton qol2-popup-close';
+			btn.setAttribute('aria-label', 'Close');
+			btn.tabIndex = -1;
+			btn.style.cssText = 'position:absolute;top:4px;right:4px;z-index:5;font-size:16px;line-height:1;';
+			btn.innerHTML = '<i class="fa fa-times-circle" aria-hidden="true"></i>';
+			btn.addEventListener('click', function (e) {
+				e.preventDefault();
+				e.stopPropagation();
+				var roomId = el.id.replace(/^room-/, '');
+				if (win.PS && typeof win.PS.leave === 'function') win.PS.leave(roomId);
+				else el.style.display = 'none'; // defensive fallback, should never be needed
+			});
+			el.appendChild(btn);
+		}
+		function scan(root) {
+			if (!root || root.nodeType !== 1) return;
+			if (isTargetPopup(root)) addCloseButton(root);
+			if (!root.querySelectorAll) return;
+			var found = root.querySelectorAll('.ps-popup[id]');
+			for (var i = 0; i < found.length; i++) {
+				if (isTargetPopup(found[i])) addCloseButton(found[i]);
+			}
+		}
+		new MutationObserver(function (mutations) {
+			for (var i = 0; i < mutations.length; i++) {
+				var added = mutations[i].addedNodes;
+				for (var j = 0; j < added.length; j++) scan(added[j]);
+			}
+		}).observe(document.body, { childList: true, subtree: true });
+		scan(document.body);
+	})();
+
+	console.log('[Showdown Suite] v1.5.15 (build: newclient-qol24) loaded - Music, QoL, Move to Folder, Battle Update, OTS Pokepaste Modifier, Text Size, Rainbow Buttons.');
 })();
