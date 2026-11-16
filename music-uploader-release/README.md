@@ -136,7 +136,7 @@ This is the easiest part - no coding or typing commands required.
 1. Double-click `music_uploader.exe` in the folder.
 2. A window opens asking you to pick a folder - choose the folder on your computer where your music files are.
 3. The tool works through your files automatically, converting anything that isn't already mp3 (you'll see progress printed on screen).
-4. For each song, it suggests a cleaned-up name (stripping things like download-site watermarks and track numbers) and asks what you want to do:
+4. For each song, it suggests a cleaned-up name (stripping things like download-site watermarks, track numbers and commas) and asks what you want to do:
    - **Press Enter** to accept the suggested name
    - **Type a new name** and press Enter to use that instead
    - **Type `s`** and press Enter to skip that file entirely
@@ -173,6 +173,8 @@ pip install pyinstaller
 pyinstaller --onefile --console music_uploader.py
 ```
 
+Or, to rebuild with the settings already saved in `music_uploader.spec` (one file, with a console window), run `pyinstaller music_uploader.spec` instead.
+
 The result appears in a new `dist` folder. Two things worth knowing if you do this:
 - Keep `config.json` sitting next to whichever `.exe` you actually run, not next to the `.py` file.
 - Don't remove `--console` from that command - the whole review step (Part 4, step 4 above) happens through typed input, so a version built without a console window would have nowhere for you to type into.
@@ -183,3 +185,4 @@ The result appears in a new `dist` folder. Two things worth knowing if you do th
 
 - The automatic filename cleanup is rule-based, not perfect. It handles common cases well, but covers, fan edits, and theme songs especially can still need a manual tweak - that's exactly what the rename option in Part 4 is for.
 - Conversions are done at 320kbps, the highest quality mp3 supports.
+- Commas in song names are replaced automatically, including in a name you type yourself at the review step: `Artist A, Artist B - Song` becomes `Artist A & Artist B - Song`, and a comma inside brackets is simply dropped. This matters because GitHub sends each music file's name in a web header, and Chrome refuses to load any file whose name has a comma in it - the upload would work, but the song would never play. A number written with a comma, like `10,000`, becomes `10000`. Showdown hides a number at the very start of a song name, so if a name ends up starting that way the tool says so and you can type the number out in words instead.

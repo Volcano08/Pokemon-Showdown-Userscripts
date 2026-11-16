@@ -3,8 +3,9 @@
 Showdown Music Uploader
 ========================
 Pick a folder of audio files -> convert anything that isn't mp3 (max quality,
-metadata preserved) -> clean up filenames -> review/edit them in the console
--> upload to GitHub -> get back a ready-to-paste JS array of
+metadata preserved) -> clean up filenames (commas are replaced, because a
+comma in the name stops the file loading in Chrome) -> review/edit them in
+the console -> upload to GitHub -> get back a ready-to-paste JS array of
 raw.githubusercontent.com links, in the same style used by the MUSIC_TRACKS
 array in Showdown Suite.
 
@@ -132,9 +133,10 @@ def _write_config_template():
 # FILENAME SANITIZATION
 # ============================================================
 # Rule-based cleanup - strips known downloader watermarks, leading track
-# numbers, and bracketed/parenthetical junk. Won't always separate "part
-# of the title" from "descriptor" perfectly without a metadata lookup,
-# which is what the review/edit step right after this is for.
+# numbers, bracketed/parenthetical junk, and commas (see fix_commas below).
+# Won't always separate "part of the title" from "descriptor" perfectly
+# without a metadata lookup, which is what the review/edit step right
+# after this is for.
 
 KNOWN_WATERMARKS = [
     r"spotisaver",
@@ -163,6 +165,56 @@ JUNK_PHRASES = [
     r"remaster(?:ed)?(?:\s+\d{4})?",
     r"lyric\s+video",
 ]
+
+
+# ------------------------------------------------------------
+# Commas
+# ------------------------------------------------------------
+# raw.githubusercontent.com serves an mp3 under ~10 MiB with an UNQUOTED
+#     Content-Disposition: attachment; filename=Showdown Music/<name>.mp3
+# header. Chrome splits a header value at every comma, so a comma in <name>
+# looks like a second, different Content-Disposition header and Chrome
+# refuses the whole response (net::ERR_RESPONSE_HEADERS_MULTIPLE_CONTENT_
+# DISPOSITION). The song uploads fine but can never play, and re-uploading
+# the same name can't help - the name itself must not contain a comma.
+# fix_commas() runs on the suggested name AND on anything typed at the
+# review prompt.
+
+_BRACKET_GROUP = re.compile(r"\([^)]*\)|\[[^\]]*\]|\{[^}]*\}")
+
+
+def fix_commas(name):
+    """Return `name` with every comma removed (a name without one comes back
+    unchanged):
+        'Zac Efron, Zendaya - Rewrite The Stars' -> 'Zac Efron & Zendaya - Rewrite The Stars'
+        'Power Rangers (Theme Song, Season 6)'   -> 'Power Rangers (Theme Song Season 6)'
+        '10,000 Foes - Someone'                  -> '10000 Foes - Someone'
+    """
+    if "," not in name:
+        return name
+    # 1. commas inside (...) [...] {...} are just dropped
+    fixed = _BRACKET_GROUP.sub(lambda m: re.sub(r"\s*,\s*", " ", m.group(0)), name)
+    # 2. thousands separators: 10,000 -> 10000
+    fixed = re.sub(r"(?<=\d),(?=\d{3}(?!\d))", "", fixed)
+    # 3. a comma between two things is a list: 'A, B,C' -> 'A & B & C'
+    fixed = re.sub(r"(?<=\S)\s*,(?:\s*,)*\s*(?=\S)", " & ", fixed)
+    # 4. any comma still left (leading / trailing) just goes
+    fixed = fixed.replace(",", "")
+    # 5. tidy up: 'A, & B' must not become 'A & & B'
+    fixed = re.sub(r"&(?:\s*&)+", "&", fixed)
+    return re.sub(r"\s+", " ", fixed).strip()
+
+
+def leading_number_note(name):
+    """Showdown Suite's player hides a leading number when it shows a track
+    title ('10000 Foes' is shown as 'Foes'). Dropping a comma can create one
+    ('10,000 Foes' -> '10000 Foes'), so the review step uses this to say so
+    while the name can still be changed. Returns the note text, or None."""
+    if not re.match(r"^\d+[.\s-]", name):
+        return None
+    shown = re.sub(r"^\d+[.\s-]+", "", name)
+    return (f"    note: Showdown's player hides a leading number, so this would show as '{shown}'.\n"
+            f"          Type the number out in words if you want it shown.")
 
 
 def sanitize_filename(raw_name, verbose=True):
@@ -202,6 +254,13 @@ def sanitize_filename(raw_name, verbose=True):
         name = re.sub(pattern, "", name)
         if verbose and name != before:
             LOGGER.log(f"stripped bracketed content {label} -> '{name}'", indent=1)
+
+    # After the leading-number step on purpose: removing the comma from
+    # "10,000 Foes" must not turn it into a "track number" that gets stripped.
+    before = name
+    name = fix_commas(name)
+    if verbose and name != before:
+        LOGGER.log(f"replaced commas (a comma in the name stops the file loading in Chrome) -> '{name}'", indent=1)
 
     before = name
     name = re.sub(r"\s+", " ", name)
@@ -415,7 +474,12 @@ def review_in_console(files_with_suggestions):
     total = len(files_with_suggestions)
     for i, (path, suggestion) in enumerate(files_with_suggestions, 1):
         print(f"[{i}/{total}] {path.name}")
-        answer = input(f"    Suggested: {suggestion}\n    > ").strip()
+        print(f"    Suggested: {suggestion}")
+        if "," in path.name:
+            note = leading_number_note(suggestion)
+            if note:
+                print(note)
+        answer = input("    > ").strip()
         if answer.lower() in ("s", "skip"):
             print("    -> skipped\n")
             decisions.append((path, None))
@@ -423,8 +487,19 @@ def review_in_console(files_with_suggestions):
             print(f"    -> using: {suggestion}\n")
             decisions.append((path, suggestion))
         else:
-            print(f"    -> using: {answer}\n")
-            decisions.append((path, answer))
+            # A name typed here gets the same comma fix as the suggestion.
+            final = fix_commas(answer)
+            if final != answer:
+                print(f"    (commas stop the file loading in Chrome - changed to: {final})")
+                note = leading_number_note(final)
+                if note:
+                    print(note)
+            if final:
+                print(f"    -> using: {final}\n")
+                decisions.append((path, final))
+            else:
+                print("    -> nothing left once the commas are removed - skipped\n")
+                decisions.append((path, None))
 
     chosen = [(path, name) for path, name in decisions if name]
     skipped_count = len(decisions) - len(chosen)
@@ -506,7 +581,9 @@ def run():
     urls = []
     for i, (path, final_name) in enumerate(chosen, 1):
         LOGGER.log(f"[{i}/{len(chosen)}]")
-        remote_filename = final_name + ".mp3"
+        # Every name has already been through fix_commas(); doing it once more
+        # here means no code path can upload a name with a comma in it.
+        remote_filename = fix_commas(final_name) + ".mp3"
         ok = upload_to_github(config, path, remote_filename)
         if ok:
             urls.append(build_raw_url(config, remote_filename))
